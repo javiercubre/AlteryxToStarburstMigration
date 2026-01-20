@@ -48,13 +48,24 @@ class DBTGenerator:
         self.sources: Dict[str, Dict[str, SourceInfo]] = {}  # schema -> {table -> SourceInfo}
         self.models_info: Dict[str, ModelInfo] = {}  # model_name -> ModelInfo
         self.models_generated: List[str] = []
+        self.macros_generated: List[str] = []  # Track generated macros
         self._node_columns: Dict[int, List[str]] = {}  # tool_id -> columns (cache)
         self._current_workflow: Optional[AlteryxWorkflow] = None
+        self._macro_name_map: Dict[str, str] = {}  # original macro path -> dbt macro name
 
-    def generate(self, workflows: List[AlteryxWorkflow]) -> None:
-        """Generate complete DBT project from workflows."""
+    def generate(self, workflows: List[AlteryxWorkflow], macro_inventory=None) -> None:
+        """Generate complete DBT project from workflows.
+
+        Args:
+            workflows: List of parsed Alteryx workflows
+            macro_inventory: Optional MacroInventory with resolved macro information
+        """
         # Create directory structure
         self._create_structure()
+
+        # Generate reusable macros from Alteryx macros
+        if macro_inventory:
+            self._generate_macros(macro_inventory)
 
         # Collect all sources with column info
         self._collect_sources(workflows)
@@ -77,6 +88,8 @@ class DBTGenerator:
 
         print(f"DBT project generated at: {self.output_dir}")
         print(f"Models generated: {len(self.models_generated)}")
+        if self.macros_generated:
+            print(f"Macros generated: {len(self.macros_generated)}")
 
     def _create_structure(self) -> None:
         """Create DBT project directory structure with bronze/silver/gold naming."""
@@ -94,6 +107,269 @@ class DBTGenerator:
 
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
+
+    def _generate_macros(self, macro_inventory) -> None:
+        """Generate DBT macros from Alteryx macros for reusability.
+
+        Converts Alteryx macros (.yxmc) into reusable DBT/Jinja macros that can
+        be called from multiple models, maintaining the same reusability pattern
+        as the original Alteryx macros.
+        """
+        from models import MacroInfo
+
+        for macro_name, macro_info in macro_inventory.macros.items():
+            if not macro_info.found or not macro_info.workflow:
+                continue
+
+            # Generate DBT macro name (sanitized)
+            dbt_macro_name = self._sanitize_name(Path(macro_name).stem)
+
+            # Store mapping for later reference
+            self._macro_name_map[macro_info.file_path] = dbt_macro_name
+
+            # Generate the macro content
+            macro_content = self._generate_macro_content(macro_info, dbt_macro_name)
+
+            # Write macro file
+            macro_file = self.output_dir / "macros" / f"{dbt_macro_name}.sql"
+            self._write_file(macro_file, macro_content)
+            self.macros_generated.append(dbt_macro_name)
+
+        # Generate a macros index file documenting all macros
+        if self.macros_generated:
+            self._generate_macros_yml(macro_inventory)
+
+    def _generate_macro_content(self, macro_info, dbt_macro_name: str) -> str:
+        """Generate DBT macro content from an Alteryx macro."""
+        workflow = macro_info.workflow
+        if not workflow:
+            return f"-- Macro: {macro_info.name}\n-- Could not parse macro content\n"
+
+        # Find macro inputs and outputs
+        inputs = []
+        outputs = []
+        transform_nodes = []
+
+        for node in workflow.nodes:
+            if node.plugin_name == "Macro Input":
+                input_name = node.annotation or node.configuration.get('Name', f'input_{node.tool_id}')
+                inputs.append({'name': self._sanitize_name(input_name), 'node': node})
+            elif node.plugin_name == "Macro Output":
+                output_name = node.annotation or node.configuration.get('Name', f'output_{node.tool_id}')
+                outputs.append({'name': self._sanitize_name(output_name), 'node': node})
+            elif node.category not in [ToolCategory.INPUT, ToolCategory.OUTPUT]:
+                transform_nodes.append(node)
+
+        # Build macro parameters from inputs
+        params = [inp['name'] for inp in inputs]
+        params_str = ", ".join(params) if params else "source_relation"
+
+        # Generate macro header
+        content = [
+            f"{{#",
+            f"    Macro: {dbt_macro_name}",
+            f"    Converted from Alteryx macro: {macro_info.name}",
+            f"    Description: {workflow.metadata.description or 'Reusable transformation macro'}",
+            f"",
+            f"    Inputs: {', '.join(params) if params else 'source_relation'}",
+            f"    Outputs: {', '.join([o['name'] for o in outputs]) if outputs else 'transformed data'}",
+            f"",
+            f"    Usage:",
+            f"        {{{{ {dbt_macro_name}(ref('your_source_model')) }}}}",
+            f"#}}",
+            "",
+            f"{{% macro {dbt_macro_name}({params_str}) %}}",
+            "",
+        ]
+
+        # Generate transformation CTEs
+        source_ref = params[0] if params else "source_relation"
+        cte_parts = [f"with source as (\n    select * from {{{{ {source_ref} }}}}\n)"]
+
+        # Sort nodes by dependency order
+        ordered_nodes = self._get_ordered_transform_nodes(workflow, transform_nodes)
+
+        prev_cte = "source"
+        for i, node in enumerate(ordered_nodes):
+            cte_name = f"step_{i + 1}" if i < len(ordered_nodes) - 1 else "final"
+            cte_sql = self._generate_macro_cte(node, prev_cte, cte_name)
+            cte_parts.append(cte_sql)
+            prev_cte = cte_name
+
+        # Combine CTEs
+        content.append(",\n\n".join(cte_parts))
+        content.append("")
+        content.append("select * from final")
+        content.append("")
+        content.append("{% endmacro %}")
+
+        # If there are multiple outputs, generate additional macros for each output
+        if len(outputs) > 1:
+            content.append("")
+            content.append(f"{{# Additional output macros for {dbt_macro_name} #}}")
+            for output in outputs:
+                output_macro_name = f"{dbt_macro_name}_{output['name']}"
+                content.append("")
+                content.append(f"{{% macro {output_macro_name}({params_str}) %}}")
+                content.append(f"    {{{{ {dbt_macro_name}({source_ref}) }}}}")
+                content.append(f"    -- Filter for {output['name']} output")
+                content.append("{% endmacro %}")
+
+        return "\n".join(content)
+
+    def _get_ordered_transform_nodes(self, workflow, transform_nodes: List[AlteryxNode]) -> List[AlteryxNode]:
+        """Order transformation nodes by dependency."""
+        if not transform_nodes:
+            return []
+
+        # Build dependency graph
+        node_ids = {n.tool_id for n in transform_nodes}
+        ordered = []
+        visited = set()
+
+        def visit(node):
+            if node.tool_id in visited:
+                return
+            visited.add(node.tool_id)
+
+            # Visit upstream nodes first
+            for conn in workflow.connections:
+                if conn.destination_id == node.tool_id and conn.origin_id in node_ids:
+                    origin_node = workflow.get_node_by_id(conn.origin_id)
+                    if origin_node:
+                        visit(origin_node)
+
+            ordered.append(node)
+
+        for node in transform_nodes:
+            visit(node)
+
+        return ordered
+
+    def _generate_macro_cte(self, node: AlteryxNode, source_cte: str, cte_name: str) -> str:
+        """Generate a CTE for a node within a macro."""
+        if node.plugin_name == "Filter":
+            condition = self._convert_expression(node.expression or "1=1")
+            return f"""{cte_name} as (
+    -- {node.plugin_name}: {node.annotation or ''}
+    select *
+    from {source_cte}
+    where {condition}
+)"""
+
+        elif node.plugin_name in ["Formula", "Multi-Field Formula"]:
+            formulas = node.configuration.get('formulas', [])
+            if formulas:
+                select_parts = ["*"]
+                for f in formulas:
+                    field = self._quote_column(f.get('field', 'new_field'))
+                    expr = self._convert_expression(f.get('expression', 'NULL'))
+                    select_parts.append(f"{expr} as {field}")
+
+                return f"""{cte_name} as (
+    -- {node.plugin_name}: {node.annotation or ''}
+    select
+        {','.join(chr(10) + '        ' + p for p in select_parts)}
+    from {source_cte}
+)"""
+
+        elif node.plugin_name == "Select":
+            if node.selected_fields:
+                quoted_fields = [self._quote_column(f.split(' AS ')[0].strip()) +
+                                (' as ' + self._quote_column(f.split(' AS ')[1].strip()) if ' AS ' in f.upper() else '')
+                                for f in node.selected_fields]
+                fields = ",\n        ".join(quoted_fields)
+                return f"""{cte_name} as (
+    -- {node.plugin_name}: {node.annotation or ''}
+    select
+        {fields}
+    from {source_cte}
+)"""
+
+        elif node.plugin_name == "Sort":
+            sort_fields = node.configuration.get('sort_fields', [])
+            if sort_fields:
+                order_parts = []
+                for sf in sort_fields:
+                    direction = "asc" if sf.get('order', 'Ascending') == 'Ascending' else "desc"
+                    field = self._quote_column(sf['field'])
+                    order_parts.append(f"{field} {direction}")
+                order_clause = ", ".join(order_parts)
+                return f"""{cte_name} as (
+    -- {node.plugin_name}: {node.annotation or ''}
+    select *
+    from {source_cte}
+    order by {order_clause}
+)"""
+
+        elif node.plugin_name == "Summarize":
+            group_by_quoted = [self._quote_column(f) for f in node.group_by_fields] if node.group_by_fields else []
+            group_cols = ", ".join(group_by_quoted) if group_by_quoted else "1"
+
+            agg_parts = []
+            for agg in node.aggregations:
+                action = agg.get('action', 'COUNT')
+                field = agg.get('field', '*')
+                output = self._quote_column(agg.get('output_name', field))
+                sql_func = AGGREGATION_MAP.get(action, action.upper())
+                field_ref = self._quote_column(field) if field != '*' else field
+
+                if sql_func.endswith('(DISTINCT'):
+                    agg_parts.append(f"{sql_func} {field_ref}) as {output}")
+                else:
+                    agg_parts.append(f"{sql_func}({field_ref}) as {output}")
+
+            select_parts = group_by_quoted + agg_parts if group_by_quoted else agg_parts
+            select_clause = ",\n        ".join(select_parts) if select_parts else "count(*) as record_count"
+
+            return f"""{cte_name} as (
+    -- {node.plugin_name}: {node.annotation or ''}
+    select
+        {select_clause}
+    from {source_cte}
+    group by {group_cols}
+)"""
+
+        # Default
+        return f"""{cte_name} as (
+    -- {node.plugin_name}: {node.annotation or ''} (TODO: implement)
+    select *
+    from {source_cte}
+)"""
+
+    def _generate_macros_yml(self, macro_inventory) -> None:
+        """Generate a YAML file documenting all macros."""
+        content = [
+            "# DBT Macros generated from Alteryx macros",
+            "# These macros provide reusable SQL transformations",
+            "#",
+            "# Usage: {{ macro_name(ref('source_model')) }}",
+            "",
+            "macros:",
+        ]
+
+        for macro_name, macro_info in macro_inventory.macros.items():
+            if macro_info.found and macro_info.workflow:
+                dbt_name = self._macro_name_map.get(macro_info.file_path, self._sanitize_name(macro_name))
+                usage_count = len(macro_inventory.usage.get(macro_name, []))
+
+                content.extend([
+                    f"  - name: {dbt_name}",
+                    f"    description: \"{macro_info.workflow.metadata.description or 'Converted from Alteryx macro'}\"",
+                    f"    original_file: \"{macro_info.file_path}\"",
+                    f"    used_by_workflows: {usage_count}",
+                ])
+
+                if macro_info.inputs:
+                    content.append(f"    inputs: {macro_info.inputs}")
+                if macro_info.outputs:
+                    content.append(f"    outputs: {macro_info.outputs}")
+                content.append("")
+
+        self._write_file(
+            self.output_dir / "macros" / "_macros.yml",
+            "\n".join(content)
+        )
 
     def _collect_sources(self, workflows: List[AlteryxWorkflow]) -> None:
         """Collect all data sources with column information from workflows."""
@@ -1041,11 +1317,44 @@ class DBTGenerator:
         else:
             return f"int_{workflow_prefix}_{self._sanitize_name(node.get_display_name())}"
 
+    def _generate_macro_reference_sql(self, node: AlteryxNode,
+                                       upstream: List[AlteryxNode],
+                                       source_cte: str) -> str:
+        """Generate SQL that calls a DBT macro for a macro node.
+
+        When an Alteryx workflow uses a macro, this generates SQL that calls
+        the corresponding DBT macro, maintaining reusability across models.
+        """
+        # Get the DBT macro name from the mapping
+        macro_path = node.macro_path or ""
+        dbt_macro_name = self._macro_name_map.get(
+            macro_path,
+            self._sanitize_name(Path(macro_path).stem) if macro_path else "unknown_macro"
+        )
+
+        # Build the macro call
+        if len(upstream) > 1:
+            # Multiple inputs - pass them as separate arguments
+            source_refs = [f"{source_cte}_{i+1}" for i in range(len(upstream))]
+            macro_call = f"{{{{ {dbt_macro_name}({', '.join(source_refs)}) }}}}"
+        else:
+            macro_call = f"{{{{ {dbt_macro_name}({source_cte}) }}}}"
+
+        return f"""-- Macro: {node.get_display_name()}
+-- Original Alteryx macro: {macro_path}
+-- Using reusable DBT macro: {dbt_macro_name}
+
+{macro_call}"""
+
     def _generate_transformation_sql(self, node: AlteryxNode,
                                       upstream: List[AlteryxNode],
                                       workflow: AlteryxWorkflow) -> str:
         """Generate SQL for a transformation node with double-quoted columns."""
         source_cte = "source" if len(upstream) <= 1 else "source_1"
+
+        # Check if this node is a macro - use the DBT macro if available
+        if node.is_macro and node.macro_path:
+            return self._generate_macro_reference_sql(node, upstream, source_cte)
 
         # Get upstream columns for explicit selects
         upstream_columns = self._get_upstream_columns(node, workflow)

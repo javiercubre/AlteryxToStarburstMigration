@@ -122,7 +122,8 @@ def analyze(args) -> int:
         dbt_dir = Path(args.generate_dbt)
         print(f"\nGenerating DBT project to: {dbt_dir}")
         dbt_generator = DBTGenerator(str(dbt_dir))
-        dbt_generator.generate(workflows)
+        # Pass macro_inventory for reusable macro generation
+        dbt_generator.generate(workflows, macro_inventory)
 
     # Summary
     print("\n" + "=" * 60)
