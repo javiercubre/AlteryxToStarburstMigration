@@ -121,7 +121,11 @@ def analyze(args) -> int:
     if args.generate_dbt:
         dbt_dir = Path(args.generate_dbt)
         print(f"\nGenerating DBT project to: {dbt_dir}")
-        dbt_generator = DBTGenerator(str(dbt_dir))
+        # Pass interactive flag (inverse of non_interactive)
+        dbt_generator = DBTGenerator(
+            str(dbt_dir),
+            interactive=not args.non_interactive
+        )
         # Pass macro_inventory for reusable macro generation
         dbt_generator.generate(workflows, macro_inventory)
 

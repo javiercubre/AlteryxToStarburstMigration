@@ -7,6 +7,8 @@ SQL Dialect: Trino SQL
 """
 import os
 import re
+import csv
+import json
 from pathlib import Path
 from typing import List, Dict, Set, Optional, Tuple
 from datetime import datetime
@@ -42,9 +44,11 @@ class ModelInfo:
 class DBTGenerator:
     """Generates DBT project structure from Alteryx workflows."""
 
-    def __init__(self, output_dir: str, project_name: str = "alteryx_migration"):
+    def __init__(self, output_dir: str, project_name: str = "alteryx_migration",
+                 interactive: bool = True):
         self.output_dir = Path(output_dir)
         self.project_name = project_name
+        self.interactive = interactive  # Whether to prompt user for missing info
         self.sources: Dict[str, Dict[str, SourceInfo]] = {}  # schema -> {table -> SourceInfo}
         self.models_info: Dict[str, ModelInfo] = {}  # model_name -> ModelInfo
         self.models_generated: List[str] = []
@@ -52,6 +56,7 @@ class DBTGenerator:
         self._node_columns: Dict[int, List[str]] = {}  # tool_id -> columns (cache)
         self._current_workflow: Optional[AlteryxWorkflow] = None
         self._macro_name_map: Dict[str, str] = {}  # original macro path -> dbt macro name
+        self._resolved_source_files: Dict[str, str] = {}  # source key -> resolved file path
 
     def generate(self, workflows: List[AlteryxWorkflow], macro_inventory=None) -> None:
         """Generate complete DBT project from workflows.
@@ -384,6 +389,10 @@ class DBTGenerator:
                 # Extract columns from node configuration
                 columns = self._extract_columns_from_node(node)
 
+                # If no columns found, try to read from the source file
+                if not columns:
+                    columns = self._try_read_source_columns(node, schema, table)
+
                 source_info = SourceInfo(
                     schema=schema,
                     table=table,
@@ -400,6 +409,216 @@ class DBTGenerator:
                     existing.columns = all_cols
                 else:
                     self.sources[schema][table] = source_info
+
+    def _try_read_source_columns(self, node: AlteryxNode, schema: str, table: str) -> List[str]:
+        """Try to read columns from the source file, prompting user if needed."""
+        columns = []
+        source_key = f"{schema}.{table}"
+
+        # First, try the source path from the node
+        source_path = node.source_path
+        if source_path:
+            columns = self._read_file_columns(source_path)
+            if columns:
+                return columns
+
+        # If interactive mode, prompt user for the file location
+        if self.interactive and source_key not in self._resolved_source_files:
+            columns = self._prompt_for_source_file(node, schema, table)
+
+        return columns
+
+    def _prompt_for_source_file(self, node: AlteryxNode, schema: str, table: str) -> List[str]:
+        """Prompt user for source file location to read column metadata."""
+        source_key = f"{schema}.{table}"
+        source_display = node.source_path or node.table_name or table
+
+        print("\n" + "=" * 60)
+        print(f"Unknown columns for source: {source_display}")
+        print(f"Schema: {schema}, Table: {table}")
+        if node.annotation:
+            print(f"Description: {node.annotation}")
+        print("=" * 60)
+        print("\nTo generate accurate DBT models, column information is needed.")
+        print("Options:")
+        print("[1] Enter path to raw data file (CSV, Excel, JSON, Parquet)")
+        print("[2] Enter columns manually (comma-separated)")
+        print("[3] Skip (will use SELECT * with TODO comment)")
+        print()
+
+        while True:
+            try:
+                choice = input("Your choice (1-3): ").strip()
+
+                if choice == "1":
+                    file_path = input("Enter full path to data file: ").strip()
+                    file_path = file_path.strip('"\'')  # Remove quotes if present
+
+                    if Path(file_path).exists():
+                        columns = self._read_file_columns(file_path)
+                        if columns:
+                            self._resolved_source_files[source_key] = file_path
+                            print(f"Found {len(columns)} columns: {', '.join(columns[:5])}{'...' if len(columns) > 5 else ''}")
+                            return columns
+                        else:
+                            print(f"Could not read columns from: {file_path}")
+                            print("Supported formats: CSV, Excel (.xlsx/.xls), JSON, Parquet")
+                            continue
+                    else:
+                        print(f"File not found: {file_path}")
+                        continue
+
+                elif choice == "2":
+                    cols_input = input("Enter column names (comma-separated): ").strip()
+                    if cols_input:
+                        columns = [c.strip() for c in cols_input.split(',') if c.strip()]
+                        if columns:
+                            print(f"Using {len(columns)} columns: {', '.join(columns[:5])}{'...' if len(columns) > 5 else ''}")
+                            return columns
+                    print("No valid columns entered. Please try again.")
+                    continue
+
+                elif choice == "3":
+                    print(f"Skipping column detection for {table}")
+                    self._resolved_source_files[source_key] = ""  # Mark as skipped
+                    return []
+
+                else:
+                    print("Invalid choice. Please enter 1, 2, or 3.")
+
+            except KeyboardInterrupt:
+                print("\nSkipping column detection")
+                return []
+            except EOFError:
+                # Non-interactive environment
+                return []
+
+    def _read_file_columns(self, file_path: str) -> List[str]:
+        """Read column names from a data file.
+
+        Supports: CSV, Excel (.xlsx/.xls), JSON, Parquet
+        """
+        path = Path(file_path)
+        if not path.exists():
+            return []
+
+        suffix = path.suffix.lower()
+        columns = []
+
+        try:
+            if suffix == '.csv':
+                columns = self._read_csv_columns(file_path)
+            elif suffix in ['.xlsx', '.xls']:
+                columns = self._read_excel_columns(file_path)
+            elif suffix == '.json':
+                columns = self._read_json_columns(file_path)
+            elif suffix == '.parquet':
+                columns = self._read_parquet_columns(file_path)
+            elif suffix in ['.txt', '.tsv']:
+                # Try as tab-separated or delimited file
+                columns = self._read_csv_columns(file_path, delimiter='\t')
+        except Exception as e:
+            print(f"Warning: Could not read {file_path}: {e}")
+
+        return columns
+
+    def _read_csv_columns(self, file_path: str, delimiter: str = ',') -> List[str]:
+        """Read column headers from a CSV file."""
+        columns = []
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                # Try to detect delimiter if comma doesn't work well
+                sample = f.read(4096)
+                f.seek(0)
+
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+                    delimiter = dialect.delimiter
+                except csv.Error:
+                    pass  # Use default delimiter
+
+                reader = csv.reader(f, delimiter=delimiter)
+                header_row = next(reader, None)
+                if header_row:
+                    columns = [col.strip() for col in header_row if col.strip()]
+        except Exception as e:
+            print(f"Warning: Error reading CSV {file_path}: {e}")
+
+        return columns
+
+    def _read_excel_columns(self, file_path: str) -> List[str]:
+        """Read column headers from an Excel file."""
+        columns = []
+        try:
+            # Try openpyxl for .xlsx
+            import openpyxl
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            ws = wb.active
+            if ws:
+                first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+                if first_row:
+                    columns = [str(cell).strip() for cell in first_row if cell is not None]
+            wb.close()
+        except ImportError:
+            print("Note: Install openpyxl for Excel support: pip install openpyxl")
+        except Exception as e:
+            # Try xlrd for .xls
+            try:
+                import xlrd
+                wb = xlrd.open_workbook(file_path)
+                ws = wb.sheet_by_index(0)
+                if ws.nrows > 0:
+                    columns = [str(cell.value).strip() for cell in ws.row(0) if cell.value]
+            except ImportError:
+                print("Note: Install xlrd for .xls support: pip install xlrd")
+            except Exception as e2:
+                print(f"Warning: Error reading Excel {file_path}: {e2}")
+
+        return columns
+
+    def _read_json_columns(self, file_path: str) -> List[str]:
+        """Read column/field names from a JSON file."""
+        columns = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            # Handle different JSON structures
+            if isinstance(data, list) and len(data) > 0:
+                # Array of objects - get keys from first object
+                if isinstance(data[0], dict):
+                    columns = list(data[0].keys())
+            elif isinstance(data, dict):
+                # Single object or nested structure
+                if all(isinstance(v, (str, int, float, bool, type(None))) for v in data.values()):
+                    # Flat object
+                    columns = list(data.keys())
+                elif 'data' in data and isinstance(data['data'], list):
+                    # Common pattern: {"data": [...]}
+                    if len(data['data']) > 0 and isinstance(data['data'][0], dict):
+                        columns = list(data['data'][0].keys())
+                elif 'records' in data and isinstance(data['records'], list):
+                    # Common pattern: {"records": [...]}
+                    if len(data['records']) > 0 and isinstance(data['records'][0], dict):
+                        columns = list(data['records'][0].keys())
+        except Exception as e:
+            print(f"Warning: Error reading JSON {file_path}: {e}")
+
+        return columns
+
+    def _read_parquet_columns(self, file_path: str) -> List[str]:
+        """Read column names from a Parquet file."""
+        columns = []
+        try:
+            import pyarrow.parquet as pq
+            parquet_file = pq.ParquetFile(file_path)
+            columns = parquet_file.schema.names
+        except ImportError:
+            print("Note: Install pyarrow for Parquet support: pip install pyarrow")
+        except Exception as e:
+            print(f"Warning: Error reading Parquet {file_path}: {e}")
+
+        return columns
 
     def _extract_columns_from_node(self, node: AlteryxNode) -> List[str]:
         """Extract column names from a node's configuration."""

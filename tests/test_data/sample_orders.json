@@ -1,0 +1,5 @@
+[
+  {"order_id": 1001, "customer_id": 1, "product": "Widget A", "quantity": 5, "price": 29.99, "order_date": "2023-06-01"},
+  {"order_id": 1002, "customer_id": 2, "product": "Widget B", "quantity": 3, "price": 49.99, "order_date": "2023-06-02"},
+  {"order_id": 1003, "customer_id": 1, "product": "Widget C", "quantity": 1, "price": 99.99, "order_date": "2023-06-03"}
+]

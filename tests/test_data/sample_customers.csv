@@ -1,0 +1,4 @@
+customer_id,customer_name,email,region,created_date,is_active
+1,John Doe,john@example.com,North,2023-01-15,true
+2,Jane Smith,jane@example.com,South,2023-02-20,true
+3,Bob Wilson,bob@example.com,East,2023-03-10,false
