@@ -112,12 +112,8 @@ def analyze(args) -> int:
     # Determine output directory
     output_dir = Path(args.output) if args.output else target_path / "alteryx_docs"
 
-    # Generate documentation
-    print(f"\nGenerating documentation to: {output_dir}")
-    doc_generator = DocumentationGenerator(str(output_dir))
-    doc_generator.generate_all(workflows, macro_inventory)
-
-    # Generate DBT scaffolding if requested
+    # Generate DBT scaffolding first if requested (to collect TODOs)
+    dbt_todos = None
     if args.generate_dbt:
         dbt_dir = Path(args.generate_dbt)
         print(f"\nGenerating DBT project to: {dbt_dir}")
@@ -128,6 +124,13 @@ def analyze(args) -> int:
         )
         # Pass macro_inventory for reusable macro generation
         dbt_generator.generate(workflows, macro_inventory)
+        # Collect TODOs for documentation
+        dbt_todos = dbt_generator.todos
+
+    # Generate documentation (including TODO guide if DBT was generated)
+    print(f"\nGenerating documentation to: {output_dir}")
+    doc_generator = DocumentationGenerator(str(output_dir))
+    doc_generator.generate_all(workflows, macro_inventory, dbt_todos)
 
     # Summary
     print("\n" + "=" * 60)

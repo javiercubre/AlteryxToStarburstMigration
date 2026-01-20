@@ -41,6 +41,18 @@ class ModelInfo:
     source_tool_id: int = 0
 
 
+@dataclass
+class TodoItem:
+    """Represents a TODO instruction in the generated DBT scaffold."""
+    file_path: str          # Path to the file containing the TODO
+    model_name: str         # Name of the model/macro
+    layer: str              # bronze, silver, gold, macro
+    todo_type: str          # Type of TODO (columns, transformation, expression, etc.)
+    description: str        # Human-readable description of what needs to be done
+    context: str = ""       # Additional context (tool name, expression, etc.)
+    priority: str = "medium"  # high, medium, low
+
+
 class DBTGenerator:
     """Generates DBT project structure from Alteryx workflows."""
 
@@ -53,10 +65,13 @@ class DBTGenerator:
         self.models_info: Dict[str, ModelInfo] = {}  # model_name -> ModelInfo
         self.models_generated: List[str] = []
         self.macros_generated: List[str] = []  # Track generated macros
+        self.todos: List[TodoItem] = []  # Track all TODO items for documentation
         self._node_columns: Dict[int, List[str]] = {}  # tool_id -> columns (cache)
         self._current_workflow: Optional[AlteryxWorkflow] = None
         self._macro_name_map: Dict[str, str] = {}  # original macro path -> dbt macro name
         self._resolved_source_files: Dict[str, str] = {}  # source key -> resolved file path
+        self._current_model_name: str = ""  # Track current model being generated
+        self._current_layer: str = ""  # Track current layer
 
     def generate(self, workflows: List[AlteryxWorkflow], macro_inventory=None) -> None:
         """Generate complete DBT project from workflows.
@@ -95,6 +110,44 @@ class DBTGenerator:
         print(f"Models generated: {len(self.models_generated)}")
         if self.macros_generated:
             print(f"Macros generated: {len(self.macros_generated)}")
+        if self.todos:
+            print(f"TODOs requiring attention: {len(self.todos)}")
+
+    def _add_todo(self, todo_type: str, description: str, context: str = "",
+                  priority: str = "medium") -> None:
+        """Track a TODO item that was generated in the scaffold."""
+        file_path = ""
+        if self._current_layer and self._current_model_name:
+            file_path = f"models/{self._current_layer}/{self._current_model_name}.sql"
+        elif self._current_model_name:
+            file_path = f"macros/{self._current_model_name}.sql"
+
+        self.todos.append(TodoItem(
+            file_path=file_path,
+            model_name=self._current_model_name,
+            layer=self._current_layer or "unknown",
+            todo_type=todo_type,
+            description=description,
+            context=context,
+            priority=priority,
+        ))
+
+    def get_todos_summary(self) -> Dict:
+        """Get a summary of all TODOs for documentation."""
+        summary = {
+            "total": len(self.todos),
+            "by_priority": {"high": 0, "medium": 0, "low": 0},
+            "by_layer": {},
+            "by_type": {},
+            "items": self.todos,
+        }
+
+        for todo in self.todos:
+            summary["by_priority"][todo.priority] = summary["by_priority"].get(todo.priority, 0) + 1
+            summary["by_layer"][todo.layer] = summary["by_layer"].get(todo.layer, 0) + 1
+            summary["by_type"][todo.todo_type] = summary["by_type"].get(todo.todo_type, 0) + 1
+
+        return summary
 
     def _create_structure(self) -> None:
         """Create DBT project directory structure with bronze/silver/gold naming."""
@@ -1312,6 +1365,10 @@ class DBTGenerator:
         table = self._get_table_name(node)
         model_name = f"stg_{workflow_prefix}_{table}"
 
+        # Set context for TODO tracking
+        self._current_model_name = model_name
+        self._current_layer = "bronze"
+
         # Get columns for this source
         columns = []
         if schema in self.sources and table in self.sources[schema]:
@@ -1323,6 +1380,12 @@ class DBTGenerator:
             select_clause = f"        {col_list}"
         else:
             select_clause = "        * -- TODO: Replace with explicit column list"
+            self._add_todo(
+                todo_type="specify_columns",
+                description="Replace SELECT * with explicit column list",
+                context=f"Source: {node.source_path or node.table_name or schema + '.' + table}",
+                priority="high"
+            )
 
         # Build the source select with explicit columns
         if columns:
@@ -1382,6 +1445,10 @@ class DBTGenerator:
         """Generate a silver (intermediate) model with table materialization."""
         model_name = f"int_{workflow_prefix}_{self._sanitize_name(node.get_display_name())}"
 
+        # Set context for TODO tracking
+        self._current_model_name = model_name
+        self._current_layer = "silver"
+
         # Get upstream dependencies
         upstream = workflow.get_upstream_nodes(node.tool_id)
 
@@ -1426,10 +1493,33 @@ class DBTGenerator:
                         ")," if i < len(upstream) - 1 else "),",
                         "",
                     ])
+                    self._add_todo(
+                        todo_type="specify_columns",
+                        description=f"Specify columns from upstream model '{up_model}'",
+                        context=f"CTE: {cte_name}",
+                        priority="medium"
+                    )
 
         # Generate transformation logic based on tool type
         sql = self._generate_transformation_sql(node, upstream, workflow)
         content.append(sql)
+
+        # Track TODOs in generated transformation SQL
+        if "-- TODO:" in sql:
+            if "specify columns" in sql.lower():
+                self._add_todo(
+                    todo_type="specify_columns",
+                    description="Specify explicit columns in transformation",
+                    context=f"Tool: {node.plugin_name}",
+                    priority="medium"
+                )
+            if "implement" in sql.lower():
+                self._add_todo(
+                    todo_type="implement_transformation",
+                    description=f"Implement {node.plugin_name} transformation logic",
+                    context=f"Tool #{node.tool_id}: {node.annotation or node.plugin_name}",
+                    priority="high"
+                )
 
         self._write_file(
             self.output_dir / "models" / "silver" / f"{model_name}.sql",
@@ -1461,6 +1551,10 @@ class DBTGenerator:
             prefix = "dim"
 
         model_name = f"{prefix}_{workflow_prefix}_{descriptive_name}"
+
+        # Set context for TODO tracking
+        self._current_model_name = model_name
+        self._current_layer = "gold"
 
         # Get upstream dependencies
         upstream = workflow.get_upstream_nodes(node.tool_id)
@@ -1507,10 +1601,33 @@ class DBTGenerator:
                         ")," if i < len(upstream) - 1 else "),",
                         "",
                     ])
+                    self._add_todo(
+                        todo_type="specify_columns",
+                        description=f"Specify columns from upstream model '{up_model}'",
+                        context=f"CTE: {cte_name}",
+                        priority="medium"
+                    )
 
         # Generate transformation logic
         sql = self._generate_transformation_sql(node, upstream, workflow)
         content.append(sql)
+
+        # Track TODOs in generated transformation SQL
+        if "-- TODO:" in sql:
+            if "specify columns" in sql.lower():
+                self._add_todo(
+                    todo_type="specify_columns",
+                    description="Specify explicit columns in output",
+                    context=f"Output: {node.target_path or node.table_name or 'unknown'}",
+                    priority="medium"
+                )
+            if "implement" in sql.lower():
+                self._add_todo(
+                    todo_type="implement_transformation",
+                    description=f"Implement {node.plugin_name} transformation logic",
+                    context=f"Tool #{node.tool_id}: {node.annotation or node.plugin_name}",
+                    priority="high"
+                )
 
         self._write_file(
             self.output_dir / "models" / "gold" / f"{model_name}.sql",

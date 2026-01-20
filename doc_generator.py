@@ -27,10 +27,17 @@ class DocumentationGenerator:
         (self.output_dir / "workflows").mkdir(exist_ok=True)
 
     def generate_all(self, workflows: List[AlteryxWorkflow],
-                     macro_inventory: Optional[MacroInventory] = None) -> None:
-        """Generate all documentation for a list of workflows."""
+                     macro_inventory: Optional[MacroInventory] = None,
+                     dbt_todos: Optional[List] = None) -> None:
+        """Generate all documentation for a list of workflows.
+
+        Args:
+            workflows: List of parsed Alteryx workflows
+            macro_inventory: Optional macro inventory for macro documentation
+            dbt_todos: Optional list of TodoItem objects from DBT scaffold generation
+        """
         # Generate index
-        self._generate_index(workflows, macro_inventory)
+        self._generate_index(workflows, macro_inventory, dbt_todos)
 
         # Generate per-workflow docs
         for workflow in workflows:
@@ -49,10 +56,15 @@ class DocumentationGenerator:
         # Generate medallion mapping
         self._generate_medallion_mapping(workflows)
 
+        # Generate TODO developer guide
+        if dbt_todos:
+            self._generate_todo_guide(dbt_todos)
+
         print(f"Documentation generated at: {self.output_dir}")
 
     def _generate_index(self, workflows: List[AlteryxWorkflow],
-                        macro_inventory: Optional[MacroInventory]) -> None:
+                        macro_inventory: Optional[MacroInventory],
+                        dbt_todos: Optional[List] = None) -> None:
         """Generate the main index.md file."""
         content = [
             "# Alteryx to Starburst Migration Documentation",
@@ -105,6 +117,14 @@ class DocumentationGenerator:
             "- [All Output Targets](targets.md)",
             "- [Macro Inventory](macros.md)",
             "- [Medallion Architecture Mapping](medallion_mapping.md)",
+        ])
+
+        # Add TODO guide link if there are TODOs
+        if dbt_todos:
+            high_priority = sum(1 for t in dbt_todos if t.priority == "high")
+            content.append(f"- [**Developer TODO Guide**](todo_guide.md) - {len(dbt_todos)} items ({high_priority} high priority)")
+
+        content.extend([
             "",
             "---",
             "",
@@ -705,6 +725,185 @@ class DocumentationGenerator:
             sanitized = sanitized[:50]
 
         return sanitized or "unknown"
+
+    def _generate_todo_guide(self, todos: List) -> None:
+        """Generate todo_guide.md with all TODO items from DBT scaffold."""
+        content = [
+            "# Developer TODO Guide",
+            "",
+            "This guide lists all TODO items that need to be addressed in the generated DBT scaffold.",
+            "Complete these items to finalize the migration from Alteryx to DBT/Starburst.",
+            "",
+        ]
+
+        # Summary
+        total = len(todos)
+        high = sum(1 for t in todos if t.priority == "high")
+        medium = sum(1 for t in todos if t.priority == "medium")
+        low = sum(1 for t in todos if t.priority == "low")
+
+        content.extend([
+            "## Summary",
+            "",
+            f"- **Total TODOs**: {total}",
+            f"- **High Priority**: {high}",
+            f"- **Medium Priority**: {medium}",
+            f"- **Low Priority**: {low}",
+            "",
+        ])
+
+        # By layer breakdown
+        by_layer = {}
+        for todo in todos:
+            layer = todo.layer
+            if layer not in by_layer:
+                by_layer[layer] = []
+            by_layer[layer].append(todo)
+
+        content.extend([
+            "## Progress Tracker",
+            "",
+            "Use this checklist to track your progress:",
+            "",
+        ])
+
+        # By type breakdown
+        by_type = {}
+        for todo in todos:
+            todo_type = todo.todo_type
+            if todo_type not in by_type:
+                by_type[todo_type] = []
+            by_type[todo_type].append(todo)
+
+        content.extend([
+            "| Type | Count | Description |",
+            "|------|-------|-------------|",
+        ])
+
+        type_descriptions = {
+            "specify_columns": "Replace SELECT * with explicit column lists",
+            "implement_transformation": "Implement custom transformation logic",
+            "review_expression": "Review and validate converted expression",
+        }
+
+        for todo_type, items in sorted(by_type.items()):
+            desc = type_descriptions.get(todo_type, todo_type.replace("_", " ").title())
+            content.append(f"| {todo_type} | {len(items)} | {desc} |")
+
+        content.append("")
+
+        # High priority items first
+        if high > 0:
+            content.extend([
+                "## High Priority Items",
+                "",
+                "These items should be addressed first as they may cause errors or incorrect results.",
+                "",
+            ])
+
+            for i, todo in enumerate([t for t in todos if t.priority == "high"], 1):
+                content.extend([
+                    f"### {i}. {todo.description}",
+                    "",
+                    f"- **File**: `{todo.file_path}`",
+                    f"- **Model**: `{todo.model_name}`",
+                    f"- **Layer**: {todo.layer}",
+                    f"- **Type**: {todo.todo_type}",
+                ])
+                if todo.context:
+                    content.append(f"- **Context**: {todo.context}")
+                content.append("")
+
+        # Layer-by-layer guide
+        content.extend([
+            "## Layer-by-Layer Guide",
+            "",
+            "Work through the TODO items layer by layer, starting with Bronze (closest to source data).",
+            "",
+        ])
+
+        layer_order = ["bronze", "silver", "gold", "macro"]
+        layer_names = {
+            "bronze": "Bronze Layer (Staging)",
+            "silver": "Silver Layer (Intermediate)",
+            "gold": "Gold Layer (Marts)",
+            "macro": "Macros",
+        }
+
+        for layer in layer_order:
+            if layer in by_layer:
+                items = by_layer[layer]
+                content.extend([
+                    f"### {layer_names.get(layer, layer.title())}",
+                    "",
+                    f"**{len(items)} items to complete:**",
+                    "",
+                ])
+
+                # Group by model
+                by_model = {}
+                for todo in items:
+                    model = todo.model_name
+                    if model not in by_model:
+                        by_model[model] = []
+                    by_model[model].append(todo)
+
+                for model, model_todos in sorted(by_model.items()):
+                    file_path = model_todos[0].file_path if model_todos else ""
+                    content.append(f"#### `{model}`")
+                    content.append(f"File: `{file_path}`")
+                    content.append("")
+                    for todo in model_todos:
+                        priority_marker = "[!]" if todo.priority == "high" else "[ ]"
+                        content.append(f"- {priority_marker} {todo.description}")
+                        if todo.context:
+                            content.append(f"  - Context: {todo.context}")
+                    content.append("")
+
+        # Instructions
+        content.extend([
+            "## How to Complete TODOs",
+            "",
+            "### Specify Columns",
+            "",
+            "When you see `SELECT *` with a TODO comment, replace it with explicit columns:",
+            "",
+            "```sql",
+            "-- Before:",
+            "select * from {{ ref('stg_source') }}  -- TODO: specify columns",
+            "",
+            "-- After:",
+            "select",
+            '    "column_1",',
+            '    "column_2",',
+            '    "column_3"',
+            "from {{ ref('stg_source') }}",
+            "```",
+            "",
+            "### Implement Transformation",
+            "",
+            "When you see a TODO to implement transformation logic, review the original Alteryx workflow",
+            "and translate the logic to Trino SQL:",
+            "",
+            "```sql",
+            "-- Before:",
+            "-- TODO: Implement CustomTool transformation",
+            "select * from source",
+            "",
+            "-- After:",
+            "select",
+            '    "id",',
+            '    upper("name") as "name_upper",',
+            '    case when "status" = 1 then \'Active\' else \'Inactive\' end as "status_text"',
+            "from source",
+            "```",
+            "",
+            "---",
+            "",
+            "[Back to Index](index.md)",
+        ])
+
+        self._write_file(self.output_dir / "todo_guide.md", "\n".join(content))
 
     def _write_file(self, path: Path, content: str) -> None:
         """Write content to a file."""
