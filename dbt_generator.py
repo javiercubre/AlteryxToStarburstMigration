@@ -19,6 +19,8 @@ from models import (
 )
 from transformation_analyzer import TransformationAnalyzer
 from tool_mappings import get_dbt_prefix, AGGREGATION_MAP
+from quality_validator import QualityValidator, create_validation_seed_template
+from formula_converter import FormulaConverter, convert_aggregation
 
 
 @dataclass
@@ -57,14 +59,16 @@ class DBTGenerator:
     """Generates DBT project structure from Alteryx workflows."""
 
     def __init__(self, output_dir: str, project_name: str = "alteryx_migration",
-                 interactive: bool = True):
+                 interactive: bool = True, generate_validation: bool = True):
         self.output_dir = Path(output_dir)
         self.project_name = project_name
         self.interactive = interactive  # Whether to prompt user for missing info
+        self.generate_validation = generate_validation  # Generate validation tests
         self.sources: Dict[str, Dict[str, SourceInfo]] = {}  # schema -> {table -> SourceInfo}
         self.models_info: Dict[str, ModelInfo] = {}  # model_name -> ModelInfo
         self.models_generated: List[str] = []
         self.macros_generated: List[str] = []  # Track generated macros
+        self.validation_tests_generated: List[str] = []  # Track validation tests
         self.todos: List[TodoItem] = []  # Track all TODO items for documentation
         self._node_columns: Dict[int, List[str]] = {}  # tool_id -> columns (cache)
         self._current_workflow: Optional[AlteryxWorkflow] = None
@@ -72,6 +76,7 @@ class DBTGenerator:
         self._resolved_source_files: Dict[str, str] = {}  # source key -> resolved file path
         self._current_model_name: str = ""  # Track current model being generated
         self._current_layer: str = ""  # Track current layer
+        self._formula_converter = FormulaConverter()  # Alteryx to Trino formula converter
 
     def generate(self, workflows: List[AlteryxWorkflow], macro_inventory=None) -> None:
         """Generate complete DBT project from workflows.
@@ -103,6 +108,10 @@ class DBTGenerator:
         # Generate dbt tests
         self._generate_tests()
 
+        # Generate validation tests for parallel testing (Issue #5)
+        if self.generate_validation:
+            self._generate_validation_tests()
+
         # Generate dbt_project.yml
         self._generate_project_yml()
 
@@ -110,6 +119,8 @@ class DBTGenerator:
         print(f"Models generated: {len(self.models_generated)}")
         if self.macros_generated:
             print(f"Macros generated: {len(self.macros_generated)}")
+        if self.validation_tests_generated:
+            print(f"Validation tests generated: {len(self.validation_tests_generated)}")
         if self.todos:
             print(f"TODOs requiring attention: {len(self.todos)}")
 
@@ -1949,26 +1960,28 @@ select * from final  -- TODO: specify columns"""
     def _convert_expression(self, expr: str) -> str:
         """Convert Alteryx expression to Trino SQL with quoted identifiers.
 
-        Properly parses and converts Alteryx functions like IIF(), IsNull(), IsEmpty()
-        to their ANSI SQL equivalents.
+        Uses the FormulaConverter to convert Alteryx functions (IIF, IsNull, IsEmpty,
+        string functions, date functions, math functions, etc.) to their Trino SQL
+        equivalents. This addresses Issue #6: Alteryx formulas to SQL conversion.
+
+        Reference: https://help.alteryx.com/current/en/designer/functions.html
         """
         if not expr:
             return "NULL"
 
-        sql = expr.strip()
+        # Use the comprehensive formula converter
+        sql = self._formula_converter.convert(expr)
 
-        # Replace field references [FieldName] with "FieldName"
-        sql = re.sub(r'\[([^\]]+)\]', r'"\1"', sql)
-
-        # Replace operators
-        sql = sql.replace('==', '=')
-        sql = sql.replace('&&', ' AND ')
-        sql = sql.replace('||', ' OR ')
-
-        # Convert Alteryx functions to SQL
-        sql = self._convert_iif_to_case(sql)
-        sql = self._convert_isnull(sql)
-        sql = self._convert_isempty(sql)
+        # Track any conversion notes/warnings
+        notes = self._formula_converter.get_conversion_notes()
+        if notes:
+            for note in notes:
+                self._add_todo(
+                    "expression",
+                    f"Review formula conversion: {note}",
+                    context=expr[:100] if len(expr) > 100 else expr,
+                    priority="medium"
+                )
 
         return sql
 
@@ -2264,6 +2277,53 @@ select * from final  -- TODO: specify columns"""
         self._write_file(
             self.output_dir / "tests" / "_test_examples.yml",
             "\n".join(content)
+        )
+
+    def _generate_validation_tests(self) -> None:
+        """Generate validation tests for parallel comparison between Alteryx and DBT.
+
+        This implements the quality testing framework (Issue #5) to support:
+        - Record count comparison
+        - Data point quantities
+        - Null value completeness per output field
+        - Layer-to-layer validation (bronze vs raw, silver vs staging, gold vs fed)
+        """
+        validator = QualityValidator(str(self.output_dir))
+
+        # Generate validation test files
+        validation_files = validator.write_validation_outputs(
+            self.output_dir, self.models_info
+        )
+        self.validation_tests_generated.extend(validation_files)
+
+        # Create seed template for expected Alteryx counts
+        seed_file = create_validation_seed_template(self.output_dir)
+        self.validation_tests_generated.append(seed_file)
+
+        # Generate validation documentation
+        from quality_validator import ValidationReport
+        report = ValidationReport(
+            report_name=f"{self.project_name}_validation",
+            total_tables_validated=len(self.models_info),
+        )
+        validation_doc = validator.generate_validation_documentation(report)
+
+        self._write_file(
+            self.output_dir / "docs" / "VALIDATION.md",
+            validation_doc
+        )
+        self.validation_tests_generated.append(
+            str(self.output_dir / "docs" / "VALIDATION.md")
+        )
+
+        # Add TODO for validation setup
+        self._current_model_name = "validation"
+        self._current_layer = "tests"
+        self._add_todo(
+            "validation_setup",
+            "Configure Alteryx output sources for parallel validation",
+            "Update seeds/alteryx_expected_counts.csv with actual Alteryx output counts",
+            priority="high"
         )
 
     def _generate_project_yml(self) -> None:

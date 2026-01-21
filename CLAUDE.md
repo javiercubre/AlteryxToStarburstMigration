@@ -40,9 +40,12 @@ python tests/test_source_columns.py
 ├── doc_generator.py              # Markdown documentation generation
 ├── dbt_generator.py              # DBT project scaffolding (largest module)
 ├── tool_mappings.py              # Alteryx → SQL/DBT mappings
+├── formula_converter.py          # Alteryx formula → Trino SQL conversion
+├── quality_validator.py          # Parallel validation for migration testing
 ├── models.py                     # Data classes & enums
 ├── tests/
 │   ├── test_source_columns.py    # Column detection tests
+│   ├── test_formula_converter.py # Formula conversion tests
 │   └── test_data/                # Test fixtures (CSV, JSON)
 └── samples/
     ├── *.yxmd                    # Sample Alteryx workflows
@@ -59,8 +62,10 @@ python tests/test_source_columns.py
 | `transformation_analyzer.py` | ~570 | Graph-based analysis, topological sort, lineage |
 | `macro_handler.py` | ~280 | Interactive macro resolution, path caching |
 | `doc_generator.py` | ~910 | Markdown generation, Mermaid diagrams |
-| `dbt_generator.py` | ~2385 | DBT scaffolding, SQL generation, column detection |
+| `dbt_generator.py` | ~2450 | DBT scaffolding, SQL generation, column detection, validation |
 | `tool_mappings.py` | ~440 | 100+ Alteryx tool → SQL/DBT mappings |
+| `formula_converter.py` | ~400 | Alteryx formula → Trino SQL with 60+ function mappings |
+| `quality_validator.py` | ~350 | Parallel validation tests for migration (record counts, null checks) |
 
 ## Technology Stack
 
@@ -132,6 +137,7 @@ The project uses a custom test framework (not pytest):
 ```bash
 # Run all tests
 python tests/test_source_columns.py
+python tests/test_formula_converter.py
 ```
 
 Test pattern:
@@ -146,6 +152,11 @@ def test_csv_column_reading():
 if __name__ == '__main__':
     run_all_tests()
 ```
+
+### Test Coverage
+- **Source column detection**: CSV, JSON, Parquet file reading
+- **Formula conversion**: 60+ Alteryx functions → Trino SQL mappings
+- **Validation tests**: Record counts, null completeness checks
 
 ## Common Development Tasks
 
@@ -230,6 +241,18 @@ dbt_project/
    3. Read from source file (CSV/JSON/Parquet headers)
    4. Interactive prompt (if enabled)
    5. Fallback placeholder columns
+
+8. **Formula Conversion:** The `formula_converter.py` module converts Alteryx formulas to Trino SQL:
+   - String functions: `Trim()`, `Left()`, `Right()`, `Replace()`, `Contains()`, etc.
+   - Math functions: `Abs()`, `Ceil()`, `Floor()`, `Round()`, `Sqrt()`, etc.
+   - Date functions: `DateTimeNow()`, `DateTimeYear()`, `DateTimeDiff()`, etc.
+   - Conditional: `IIF()` → `CASE WHEN`, `IsNull()`, `IsEmpty()`, `Coalesce()`, etc.
+   - Reference: https://help.alteryx.com/current/en/designer/functions.html
+
+9. **Quality Validation:** The `quality_validator.py` module generates parallel validation tests:
+   - Record count comparison between Alteryx and DBT outputs
+   - Null completeness checks per column
+   - Layer-to-layer validation (bronze vs raw, silver vs staging, gold vs fed)
 
 ## Git Workflow
 
