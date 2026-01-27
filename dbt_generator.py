@@ -169,6 +169,7 @@ class DBTGenerator:
             self.output_dir / "models" / "silver",      # Renamed from intermediate
             self.output_dir / "models" / "gold",        # Renamed from marts
             self.output_dir / "macros",
+            self.output_dir / "macros" / "migration",   # Reusable migration macros
             self.output_dir / "tests",
             self.output_dir / "tests" / "generic",
             self.output_dir / "tests" / "singular",
@@ -176,6 +177,84 @@ class DBTGenerator:
 
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
+
+        # Copy reusable migration macros
+        self._copy_migration_macros()
+
+    def _copy_migration_macros(self) -> None:
+        """Copy reusable DBT macros for common Alteryx migration patterns.
+
+        These macros provide Trino-compatible implementations of common
+        Alteryx tool patterns like deduplication, window functions, pivoting, etc.
+        """
+        import shutil
+
+        # Source directory containing migration macros (relative to this file)
+        source_macros_dir = Path(__file__).parent / "dbt_macros"
+        target_macros_dir = self.output_dir / "macros" / "migration"
+
+        if not source_macros_dir.exists():
+            print(f"Warning: Migration macros directory not found at {source_macros_dir}")
+            return
+
+        # Copy all .sql files from dbt_macros to the generated project
+        macro_files = list(source_macros_dir.glob("*.sql"))
+        for macro_file in macro_files:
+            target_file = target_macros_dir / macro_file.name
+            shutil.copy2(macro_file, target_file)
+
+        if macro_files:
+            print(f"Copied {len(macro_files)} reusable migration macros")
+
+            # Generate an index file documenting the migration macros
+            self._generate_migration_macros_index(macro_files)
+
+    def _generate_migration_macros_index(self, macro_files: List[Path]) -> None:
+        """Generate documentation index for migration macros."""
+        content = [
+            "{#",
+            "    Migration Macros Index",
+            "    =======================",
+            "    These macros provide Trino/Starburst compatible implementations",
+            "    of common Alteryx transformation patterns.",
+            "",
+            "    Macros included:",
+        ]
+
+        macro_descriptions = {
+            "deduplicate.sql": "Remove duplicate rows using ROW_NUMBER (Alteryx: Unique tool)",
+            "running_total.sql": "Calculate running/cumulative totals (Alteryx: Multi-Row Formula, Running Total)",
+            "window_rank.sql": "Add ranking columns with ROW_NUMBER/RANK/DENSE_RANK (Alteryx: RecordID)",
+            "safe_cast.sql": "Safe type casting with TRY_CAST and fallback values (Alteryx: Formula)",
+            "split_unnest.sql": "Split delimited strings into rows (Alteryx: Text to Columns, Transpose)",
+            "generate_surrogate_key.sql": "Generate hash-based surrogate keys (Alteryx: Formula with MD5)",
+            "pivot.sql": "Pivot/CrossTab operations (Alteryx: CrossTab tool)",
+            "null_if_empty.sql": "Clean empty strings and standardize nulls (Alteryx: Data Cleansing)",
+            "date_spine.sql": "Generate date sequences (Alteryx: Generate Rows)",
+            "string_normalize.sql": "String normalization and cleaning (Alteryx: Data Cleansing, Formula)",
+        }
+
+        for macro_file in sorted(macro_files):
+            desc = macro_descriptions.get(macro_file.name, "Reusable transformation macro")
+            content.append(f"    - {macro_file.stem}: {desc}")
+
+        content.extend([
+            "",
+            "    Usage Example:",
+            "        {{ deduplicate(",
+            "            relation=ref('stg_customers'),",
+            "            partition_by=['customer_id'],",
+            "            order_by=['updated_at'],",
+            "            order_direction='desc'",
+            "        ) }}",
+            "#}",
+            "",
+            "-- This file serves as documentation only.",
+            "-- Each macro is defined in its own .sql file in this directory.",
+        ])
+
+        index_file = self.output_dir / "macros" / "migration" / "_index.sql"
+        self._write_file(index_file, "\n".join(content))
 
     def _generate_macros(self, macro_inventory) -> None:
         """Generate DBT macros from Alteryx macros for reusability.
