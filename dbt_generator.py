@@ -173,6 +173,7 @@ class DBTGenerator:
             self.output_dir / "tests",
             self.output_dir / "tests" / "generic",
             self.output_dir / "tests" / "singular",
+            self.output_dir / "docs",                   # Documentation directory
         ]
 
         for d in dirs:
@@ -1772,6 +1773,231 @@ class DBTGenerator:
 
 {macro_call}"""
 
+    def _generate_macro_call_sql(self, node: AlteryxNode,
+                                  upstream: List[AlteryxNode],
+                                  workflow: AlteryxWorkflow) -> Optional[str]:
+        """Generate SQL using DBT macro calls instead of raw SQL.
+
+        Returns None if no macro mapping exists for this tool.
+        """
+        from macro_mappings import get_macro_for_tool
+
+        # Build context for macro selection (e.g., join type, operation)
+        context = {}
+        if node.plugin_name == "Join":
+            context["join_type"] = node.join_type or "LEFT"
+        elif node.plugin_name == "Sample":
+            # Determine sample type from configuration
+            sample_config = node.configuration.get('sample_type', 'first')
+            context["sample_type"] = sample_config
+        elif node.plugin_name == "RegEx":
+            # Determine regex operation from configuration
+            regex_mode = node.configuration.get('mode', 'extract')
+            context["operation"] = regex_mode
+
+        # Get macro mapping for this tool
+        macro_info = get_macro_for_tool(node.plugin_name, context)
+        if not macro_info:
+            return None  # No macro mapping - fall back to raw SQL
+
+        # Build parameters for the macro call
+        params = self._build_macro_parameters(node, macro_info, upstream, workflow)
+        if params is None:
+            return None  # Cannot build parameters - fall back to raw SQL
+
+        # Generate the macro call
+        macro_call = self._format_macro_call(
+            macro_info["macro"],
+            params,
+            node.get_display_name()
+        )
+
+        return macro_call
+
+    def _build_macro_parameters(self, node: AlteryxNode,
+                                macro_info: dict,
+                                upstream: List[AlteryxNode],
+                                workflow: AlteryxWorkflow) -> Optional[dict]:
+        """Build parameter dictionary for a macro call.
+
+        Returns None if parameters cannot be built.
+        """
+        params = {}
+
+        # Add relation parameter (upstream source)
+        if macro_info.get("requires_relation", False):
+            if len(upstream) == 0:
+                # Some tools like Generate Rows don't need upstream
+                if not macro_info.get("requires_relation"):
+                    pass
+                else:
+                    return None  # Need upstream but don't have it
+            elif len(upstream) == 1:
+                # Single upstream source
+                params["relation"] = "source"
+            else:
+                # Multiple upstream sources
+                if macro_info.get("requires_right_relation", False):
+                    # Tools like Join need two explicit relations
+                    params["left_relation"] = "source_1"
+                    params["right_relation"] = "source_2"
+                elif macro_info.get("multi_relation", False):
+                    # Tools like Union can handle multiple sources
+                    params["relations"] = [f"source_{i+1}" for i in range(len(upstream))]
+                else:
+                    # Default to first source
+                    params["relation"] = "source_1"
+
+        # Map node configuration to macro parameters
+        param_mapping = macro_info.get("param_mapping", {})
+        for node_param, macro_param in param_mapping.items():
+            value = self._extract_node_parameter(node, node_param, workflow)
+            if value is not None:
+                params[macro_param] = value
+
+        return params
+
+    def _extract_node_parameter(self, node: AlteryxNode,
+                                param_name: str,
+                                workflow: AlteryxWorkflow) -> any:
+        """Extract a parameter value from an Alteryx node."""
+        if param_name == "expression":
+            return self._convert_expression(node.expression or "1=1")
+
+        elif param_name == "formulas":
+            # For Formula tool - return list of {field, expression} dicts
+            formulas = node.configuration.get('formulas', [])
+            if formulas:
+                return [
+                    {
+                        "name": f.get('field', 'new_field'),
+                        "expression": self._convert_expression(f.get('expression', 'NULL'))
+                    }
+                    for f in formulas
+                ]
+            return None
+
+        elif param_name == "selected_fields":
+            return node.selected_fields or self._get_node_columns(node, workflow)
+
+        elif param_name == "sort_fields":
+            sort_fields = node.configuration.get('sort_fields', [])
+            if sort_fields:
+                return [
+                    f"{sf['field']} {'asc' if sf.get('order', 'Ascending') == 'Ascending' else 'desc'}"
+                    for sf in sort_fields
+                ]
+            return None
+
+        elif param_name == "join_keys":
+            # Parse join keys like "col1=col2" into structured format
+            if node.join_keys:
+                return [
+                    {
+                        "left": key.split('=')[0].strip() if '=' in key else key,
+                        "right": key.split('=')[1].strip() if '=' in key else key
+                    }
+                    for key in node.join_keys
+                ]
+            return None
+
+        elif param_name == "join_type":
+            return (node.join_type or "LEFT").upper()
+
+        elif param_name == "group_by_fields":
+            return node.group_by_fields
+
+        elif param_name == "aggregations":
+            # Convert Alteryx aggregations to macro format
+            if node.aggregations:
+                return [
+                    {
+                        "column": agg.get('field', '*'),
+                        "function": AGGREGATION_MAP.get(agg.get('action', 'COUNT'), 'COUNT'),
+                        "alias": agg.get('output_name', agg.get('field', 'result'))
+                    }
+                    for agg in node.aggregations
+                ]
+            return None
+
+        # Try to get from configuration
+        return node.configuration.get(param_name)
+
+    def _format_macro_call(self, macro_name: str,
+                          params: dict,
+                          comment: str = "") -> str:
+        """Format a Jinja2 macro call with parameters.
+
+        Args:
+            macro_name: Name of the macro to call
+            params: Dictionary of parameters
+            comment: Optional comment to add before macro call
+
+        Returns:
+            Formatted macro call SQL
+        """
+        # Format parameters
+        param_lines = []
+        for key, value in params.items():
+            formatted_value = self._format_macro_param_value(value)
+            param_lines.append(f"    {key}={formatted_value}")
+
+        param_str = ",\n".join(param_lines) if param_lines else ""
+
+        # Build the macro call
+        if param_str:
+            macro_call = f"""{{{{
+    {macro_name}(
+{param_str}
+    )
+}}}}"""
+        else:
+            macro_call = f"{{{{ {macro_name}() }}}}"
+
+        # Add comment if provided
+        if comment:
+            return f"""-- {comment}
+{macro_call}"""
+        return macro_call
+
+    def _format_macro_param_value(self, value: any) -> str:
+        """Format a parameter value for use in a Jinja2 macro call."""
+        if value is None:
+            return "none"
+        elif isinstance(value, bool):
+            return "true" if value else "false"
+        elif isinstance(value, str):
+            # Check if it's a reference (source, ref(), or CTE name)
+            if value in ["source", "source_1", "source_2"] or \
+               value.startswith("source_"):
+                # Direct CTE reference - no quotes
+                return value
+            elif value.startswith("ref(") or value.startswith("source("):
+                # DBT reference - no quotes
+                return value
+            else:
+                # String literal - use quotes and escape internal quotes
+                escaped = value.replace("'", "\\'")
+                return f"'{escaped}'"
+        elif isinstance(value, (list, tuple)):
+            # Format as Jinja2 list
+            if not value:
+                return "[]"
+            formatted_items = [self._format_macro_param_value(item) for item in value]
+            return "[" + ", ".join(formatted_items) + "]"
+        elif isinstance(value, dict):
+            # Format as Jinja2 dict
+            if not value:
+                return "{}"
+            formatted_items = [
+                f"'{k}': {self._format_macro_param_value(v)}"
+                for k, v in value.items()
+            ]
+            return "{" + ", ".join(formatted_items) + "}"
+        else:
+            # Numbers and other types
+            return str(value)
+
     def _generate_transformation_sql(self, node: AlteryxNode,
                                       upstream: List[AlteryxNode],
                                       workflow: AlteryxWorkflow) -> str:
@@ -1781,6 +2007,24 @@ class DBTGenerator:
         # Check if this node is a macro - use the DBT macro if available
         if node.is_macro and node.macro_path:
             return self._generate_macro_reference_sql(node, upstream, source_cte)
+
+        # Try to generate using DBT macros first (new macro-first approach)
+        macro_sql = self._generate_macro_call_sql(node, upstream, workflow)
+        if macro_sql:
+            return macro_sql
+
+        # Fall back to legacy raw SQL generation for tools without macro mappings
+        return self._generate_transformation_sql_legacy(node, upstream, workflow, source_cte)
+
+    def _generate_transformation_sql_legacy(self, node: AlteryxNode,
+                                             upstream: List[AlteryxNode],
+                                             workflow: AlteryxWorkflow,
+                                             source_cte: str) -> str:
+        """Legacy raw SQL generation for transformation nodes (fallback).
+
+        This method contains the original SQL generation logic and is used
+        as a fallback when no macro mapping exists for a tool.
+        """
 
         # Get upstream columns for explicit selects
         upstream_columns = self._get_upstream_columns(node, workflow)

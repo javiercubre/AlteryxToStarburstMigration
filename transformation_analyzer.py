@@ -142,8 +142,16 @@ class TransformationAnalyzer:
         return ' '.join(desc_parts)
 
     def _generate_dbt_hint(self, node: AlteryxNode) -> str:
-        """Generate a DBT/SQL hint for a transformation."""
+        """Generate a DBT/SQL hint for a transformation, preferring macro references."""
         mapping = get_sql_mapping(node.plugin_name)
+
+        # Prefer showing the macro call if available
+        if 'macro' in mapping and 'dbt' in mapping:
+            macro_name = mapping['macro']
+            dbt_example = mapping['dbt']
+            macro_file = mapping.get('macro_file', 'migration')
+            return f"-- Using macro: {macro_name} (from {macro_file}.sql)\n{dbt_example}"
+
         sql_template = mapping.get('sql', '-- Custom logic required')
 
         if node.category == ToolCategory.INPUT:
