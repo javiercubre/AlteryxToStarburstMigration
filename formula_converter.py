@@ -143,6 +143,11 @@ ALTERYX_TO_TRINO_FUNCTIONS: Dict[str, Tuple[str, int]] = {
     # ============================================================
     'Distance': ('ST_DISTANCE', 2),  # Requires Trino spatial functions
     'Centroid': ('ST_CENTROID', 1),
+    'ST_Area': ('ST_AREA', 1),
+    'ST_Contains': ('ST_CONTAINS', 2),
+    'ST_Intersects': ('ST_INTERSECTS', 2),
+    'ST_Within': ('ST_WITHIN', 2),
+    'ST_Buffer': ('ST_BUFFER', 2),
 
     # ============================================================
     # FINANCE FUNCTIONS (implemented as expressions)
@@ -156,23 +161,69 @@ ALTERYX_TO_TRINO_FUNCTIONS: Dict[str, Tuple[str, int]] = {
     'FileGetDir': (None, 1),  # Not directly translatable
     'FileGetExt': ('REGEXP_EXTRACT({0}, \'\\.([^.]+)$\', 1)', 1),  # Extract file extension
     'FileGetName': ('REGEXP_EXTRACT({0}, \'([^/\\\\\\\\]+)$\', 1)', 1),  # Extract filename
+
+    # ============================================================
+    # RECORD/ROW FUNCTIONS (HIGH-03 fix: add missing functions)
+    # ============================================================
+    'RecordID': ('ROW_NUMBER() OVER ()', 0),  # Current record ID
+    'RowCount': ('COUNT(*) OVER ()', 0),  # Total row count
+
+    # ============================================================
+    # WINDOW/RUNNING FUNCTIONS (HIGH-03 fix)
+    # ============================================================
+    'RunningSum': ('SUM({0}) OVER (ORDER BY 1 ROWS UNBOUNDED PRECEDING)', 1),
+    'RunningCount': ('COUNT({0}) OVER (ORDER BY 1 ROWS UNBOUNDED PRECEDING)', 1),
+    'RunningAvg': ('AVG({0}) OVER (ORDER BY 1 ROWS UNBOUNDED PRECEDING)', 1),
+    'RunningMin': ('MIN({0}) OVER (ORDER BY 1 ROWS UNBOUNDED PRECEDING)', 1),
+    'RunningMax': ('MAX({0}) OVER (ORDER BY 1 ROWS UNBOUNDED PRECEDING)', 1),
+
+    # ============================================================
+    # STRING GENERATION FUNCTIONS (HIGH-03 fix)
+    # ============================================================
+    'GenerateRandomString': ('SUBSTR(TO_HEX(SHA256(CAST(RAND() AS VARBINARY))), 1, {0})', 1),
+    'UUID': ('UUID()', 0),
+
+    # ============================================================
+    # VARIABLE/CONTEXT FUNCTIONS (limited SQL support - HIGH-03)
+    # ============================================================
+    'GetVal': (None, 1),  # Requires workflow context - not translatable
+    'SetVal': (None, 2),  # Requires workflow context - not translatable
+    'GroupBy': (None, 1),  # Requires group context - handle separately
+    'Message': (None, 1),  # Logging - not translatable to SQL
+    'Sleep': (None, 1),  # Pause - not translatable to SQL
+
+    # ============================================================
+    # NETWORK FUNCTIONS (not available in SQL - HIGH-03)
+    # ============================================================
+    'FindIP': (None, 1),  # Requires network access
+    'GetIPAddress': (None, 0),  # Requires network access
 }
 
 # Alteryx date format specifiers to Trino format specifiers
+# HIGH-07 fix: Complete date format mappings
 ALTERYX_DATE_FORMAT_MAP = {
     '%Y': '%Y',      # 4-digit year
     '%y': '%y',      # 2-digit year
     '%m': '%m',      # Month (01-12)
     '%d': '%d',      # Day (01-31)
+    '%e': '%e',      # Day of month, no padding (HIGH-07 fix)
+    '%j': '%j',      # Day of year (001-366) (HIGH-07 fix)
     '%H': '%H',      # Hour (00-23)
     '%M': '%i',      # Minute (00-59) - Trino uses %i
     '%S': '%s',      # Second (00-59) - Trino uses %s
+    '%f': '%f',      # Microseconds
     '%B': '%M',      # Full month name
     '%b': '%b',      # Abbreviated month name
     '%A': '%W',      # Full weekday name
     '%a': '%a',      # Abbreviated weekday name
     '%p': '%p',      # AM/PM
     '%I': '%I',      # Hour (01-12)
+    '%U': '%U',      # Week number (Sunday start) (HIGH-07 fix)
+    '%W': '%v',      # Week number (Monday start) - Trino uses %v (HIGH-07 fix)
+    '%w': '%w',      # Day of week (0=Sunday)
+    '%u': '%u',      # Day of week (1=Monday)
+    '%z': '%z',      # Timezone offset
+    '%Z': '%Z',      # Timezone name
 }
 
 
@@ -443,7 +494,9 @@ def convert_alteryx_expression(expr: str) -> str:
 
 
 # Mapping of Alteryx aggregation functions for Summarize tool
+# HIGH-04 fix: Add missing aggregation mappings
 ALTERYX_AGGREGATION_TO_TRINO = {
+    # Basic aggregations
     'Sum': 'SUM',
     'Count': 'COUNT',
     'CountDistinct': 'COUNT(DISTINCT {0})',
@@ -453,16 +506,41 @@ ALTERYX_AGGREGATION_TO_TRINO = {
     'Min': 'MIN',
     'Max': 'MAX',
     'Avg': 'AVG',
+
+    # Position-based aggregations
     'First': 'FIRST_VALUE({0}) OVER ()',
     'Last': 'LAST_VALUE({0}) OVER ()',
+
+    # String aggregations (HIGH-04 fix: GroupConcat alias)
     'Concat': 'LISTAGG({0}, \',\')',  # String concatenation
+    'GroupConcat': 'LISTAGG({0}, \',\')',  # Alias for Concat (HIGH-04 fix)
+
+    # Statistical aggregations
     'Mode': 'APPROX_MOST_FREQUENT({0}, 1)',  # Approximate mode
     'StdDev': 'STDDEV',
     'StdDevP': 'STDDEV_POP',
     'Variance': 'VARIANCE',
     'VarianceP': 'VAR_POP',
     'Median': 'APPROX_PERCENTILE({0}, 0.5)',  # Approximate median
-    'Percentile': 'APPROX_PERCENTILE({0}, {1})',  # Percentile
+
+    # Percentile aggregations (HIGH-04 fix)
+    'Percentile': 'APPROX_PERCENTILE({0}, {1})',
+    'PercentileInc': 'APPROX_PERCENTILE({0}, {1})',  # Inclusive percentile (HIGH-04 fix)
+    'PercentileExc': 'APPROX_PERCENTILE({0}, {1})',  # Exclusive percentile (HIGH-04 fix)
+    'Quartile': 'APPROX_PERCENTILE({0}, ARRAY[0.25, 0.5, 0.75])',  # Quartiles
+
+    # Spatial aggregations (HIGH-04 fix)
+    'SpatialCount': 'COUNT',  # Count of spatial objects (HIGH-04 fix)
+    'SpatialUnion': 'ST_UNION({0})',  # Spatial union (HIGH-04 fix)
+
+    # Financial aggregations (HIGH-04 fix)
+    'FinancialSum': 'SUM',  # Same as Sum for Trino (HIGH-04 fix)
+
+    # Additional aggregations (HIGH-04 fix)
+    'Histogram': 'HISTOGRAM({0})',  # Returns map of value -> count (HIGH-04 fix)
+    'ProcessName': 'ARBITRARY({0})',  # Pick arbitrary value (HIGH-04 fix)
+    'SumDistinct': 'SUM(DISTINCT {0})',
+    'AvgDistinct': 'AVG(DISTINCT {0})',
 }
 
 

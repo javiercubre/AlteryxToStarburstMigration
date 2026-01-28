@@ -160,6 +160,83 @@ class DBTGenerator:
 
         return summary
 
+    def validate_sql(self) -> Dict:
+        """Validate generated SQL by attempting to compile with dbt.
+
+        HIGH-05 fix: Add SQL syntax validation step.
+
+        Returns:
+            Dict with keys:
+                - success: bool indicating if validation passed
+                - models_validated: number of models validated (if success)
+                - error: error message (if failure)
+                - details: additional details about the failure
+        """
+        import subprocess
+        import shutil
+
+        # Check if dbt is available
+        dbt_path = shutil.which('dbt')
+        if not dbt_path:
+            return {
+                'success': False,
+                'error': 'dbt not found in PATH. Install dbt to enable validation.',
+                'details': 'pip install dbt-trino'
+            }
+
+        # Check if project was generated
+        project_file = self.output_dir / 'dbt_project.yml'
+        if not project_file.exists():
+            return {
+                'success': False,
+                'error': 'No DBT project found. Generate DBT first.',
+                'details': f'Expected: {project_file}'
+            }
+
+        try:
+            # Run dbt compile to validate SQL syntax
+            result = subprocess.run(
+                ['dbt', 'compile', '--project-dir', str(self.output_dir)],
+                capture_output=True,
+                text=True,
+                timeout=120,  # 2 minute timeout
+                cwd=str(self.output_dir)
+            )
+
+            if result.returncode == 0:
+                # Count models validated
+                models_count = len(self.models_generated)
+                return {
+                    'success': True,
+                    'models_validated': models_count,
+                    'output': result.stdout
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': 'dbt compile failed with errors',
+                    'details': result.stderr or result.stdout
+                }
+
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'error': 'dbt compile timed out after 120 seconds',
+                'details': 'The project may be too large or have infinite loops'
+            }
+        except FileNotFoundError:
+            return {
+                'success': False,
+                'error': 'Could not execute dbt command',
+                'details': 'Ensure dbt is properly installed'
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f'Unexpected error during validation: {str(e)}',
+                'details': str(type(e).__name__)
+            }
+
     def _create_structure(self) -> None:
         """Create DBT project directory structure with bronze/silver/gold naming."""
         dirs = [
@@ -1141,6 +1218,34 @@ class DBTGenerator:
         # Fallback to workflow name
         return f"{self._sanitize_name(workflow.metadata.name)}_container_output"
 
+    def _expand_container_children(self, nodes: List[AlteryxNode],
+                                    workflow: AlteryxWorkflow) -> List[AlteryxNode]:
+        """Expand container nodes to include their children for processing.
+
+        HIGH-06 fix: Ensures transformations inside containers are not silently dropped.
+
+        Args:
+            nodes: List of nodes that may include containers
+            workflow: The workflow containing all nodes
+
+        Returns:
+            List of nodes with containers replaced by their children
+        """
+        expanded = []
+        for node in nodes:
+            if node.category == ToolCategory.CONTAINER:
+                # Add container's children instead of the container itself
+                for child_id in node.child_tool_ids:
+                    child = workflow.get_node_by_id(child_id)
+                    if child and child.category != ToolCategory.CONTAINER:
+                        expanded.append(child)
+                    elif child and child.category == ToolCategory.CONTAINER:
+                        # Recursively expand nested containers
+                        expanded.extend(self._expand_container_children([child], workflow))
+            else:
+                expanded.append(node)
+        return expanded
+
     def _quote_column(self, col: str) -> str:
         """Wrap column name in double quotes for Trino compatibility."""
         # Don't quote if already quoted or if it's a *
@@ -1202,17 +1307,16 @@ class DBTGenerator:
 
         # Generate silver models (intermediate) - aggregate sequential transforms
         silver_nodes = medallion.get(MedallionLayer.SILVER.value, [])
-        # Filter out containers
-        silver_nodes = [n for n in silver_nodes if n.category != ToolCategory.CONTAINER]
+        # HIGH-06 fix: Process container children instead of skipping them
+        silver_nodes = self._expand_container_children(silver_nodes, workflow)
         # Group and aggregate silver models
         self._generate_aggregated_silver_models(silver_nodes, workflow_prefix, workflow)
 
         # Generate gold models (marts)
         gold_nodes = medallion.get(MedallionLayer.GOLD.value, [])
+        # HIGH-06 fix: Process container children instead of skipping them
+        gold_nodes = self._expand_container_children(gold_nodes, workflow)
         for node in gold_nodes:
-            # Skip containers - their children should be processed separately
-            if node.category == ToolCategory.CONTAINER:
-                continue
             self._generate_gold_model(node, workflow_prefix, workflow)
 
     def _generate_aggregated_silver_models(self, silver_nodes: List[AlteryxNode],

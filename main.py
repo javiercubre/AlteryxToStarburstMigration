@@ -127,6 +127,17 @@ def analyze(args) -> int:
         # Collect TODOs for documentation
         dbt_todos = dbt_generator.todos
 
+        # Validate generated SQL if requested (HIGH-05 fix)
+        if args.validate:
+            print("\nValidating generated SQL...")
+            validation_result = dbt_generator.validate_sql()
+            if validation_result['success']:
+                print(f"  Validation passed: {validation_result['models_validated']} models validated")
+            else:
+                print(f"  Validation failed: {validation_result['error']}")
+                if args.verbose and validation_result.get('details'):
+                    print(f"  Details: {validation_result['details']}")
+
     # Generate documentation (including TODO guide if DBT was generated)
     print(f"\nGenerating documentation to: {output_dir}")
     doc_generator = DocumentationGenerator(str(output_dir))
@@ -215,6 +226,12 @@ Examples:
         '-v', '--verbose',
         action='store_true',
         help='Enable verbose output'
+    )
+
+    analyze_parser.add_argument(
+        '--validate',
+        action='store_true',
+        help='Validate generated SQL by running dbt compile (requires dbt to be installed)'
     )
 
     # Parse arguments
