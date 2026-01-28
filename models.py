@@ -122,6 +122,29 @@ class AlteryxWorkflow:
         upstream_ids = [c.origin_id for c in self.connections if c.destination_id == tool_id]
         return [n for n in self.nodes if n.tool_id in upstream_ids]
 
+    def get_upstream_connections(self, tool_id: int) -> List[AlteryxConnection]:
+        """Get all connections that feed into the given tool.
+
+        Returns connections with full anchor information for tools like Join
+        that need to distinguish Left vs Right inputs (HIGH-02 fix).
+        """
+        return [c for c in self.connections if c.destination_id == tool_id]
+
+    def get_upstream_node_by_anchor(self, tool_id: int, anchor: str) -> Optional[AlteryxNode]:
+        """Get the upstream node connected to a specific input anchor.
+
+        Args:
+            tool_id: The tool ID to find upstream for
+            anchor: The destination anchor name (e.g., 'Left', 'Right', 'Input')
+
+        Returns:
+            The upstream node connected to that anchor, or None
+        """
+        for conn in self.connections:
+            if conn.destination_id == tool_id and conn.destination_anchor.lower() == anchor.lower():
+                return self.get_node_by_id(conn.origin_id)
+        return None
+
 
 @dataclass
 class MacroInfo:

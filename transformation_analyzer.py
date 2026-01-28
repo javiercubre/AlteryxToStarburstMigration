@@ -9,6 +9,7 @@ from models import (
     TransformationStep, DataLineage, ToolCategory, MedallionLayer
 )
 from tool_mappings import get_medallion_layer, get_sql_mapping, AGGREGATION_MAP
+from formula_converter import FormulaConverter
 
 
 class TransformationAnalyzer:
@@ -16,6 +17,7 @@ class TransformationAnalyzer:
 
     def __init__(self, workflow: AlteryxWorkflow):
         self.workflow = workflow
+        self._formula_converter = FormulaConverter()  # Reuse formula_converter for expression conversion
         self._build_graph()
 
     def _build_graph(self):
@@ -216,183 +218,14 @@ class TransformationAnalyzer:
         return sql_template
 
     def _convert_alteryx_expression(self, expr: str) -> str:
-        """Convert Alteryx expression syntax to SQL.
+        """Convert Alteryx expression syntax to Trino SQL.
 
-        Properly parses and converts Alteryx functions like IIF(), IsNull(), IsEmpty()
-        to their ANSI SQL equivalents.
+        Delegates to FormulaConverter for consistent expression handling across
+        the codebase (CRIT-02 fix: consolidate duplicate conversion logic).
         """
         if not expr:
             return expr
-
-        import re
-
-        sql = expr.strip()
-
-        # Replace Alteryx field references [FieldName] with SQL column references
-        sql = re.sub(r'\[([^\]]+)\]', r'"\1"', sql)
-
-        # Replace operators
-        sql = sql.replace('==', '=')
-        sql = sql.replace('!=', '<>')
-        sql = sql.replace('&&', ' AND ')
-        sql = sql.replace('||', ' OR ')
-
-        # Convert Alteryx functions to SQL
-        sql = self._convert_iif_to_case(sql)
-        sql = self._convert_isnull(sql)
-        sql = self._convert_isempty(sql)
-
-        return sql
-
-    def _find_matching_paren(self, expr: str, start: int) -> int:
-        """Find the index of the closing parenthesis matching the one at start."""
-        depth = 1
-        i = start + 1
-        while i < len(expr) and depth > 0:
-            if expr[i] == '(':
-                depth += 1
-            elif expr[i] == ')':
-                depth -= 1
-            i += 1
-        return i - 1 if depth == 0 else -1
-
-    def _split_iif_args(self, args_str: str) -> list:
-        """Split IIF arguments respecting nested parentheses and quotes."""
-        args = []
-        current = ""
-        depth = 0
-        in_string = False
-        string_char = None
-
-        for char in args_str:
-            if char in ('"', "'") and not in_string:
-                in_string = True
-                string_char = char
-                current += char
-            elif char == string_char and in_string:
-                in_string = False
-                string_char = None
-                current += char
-            elif char == '(' and not in_string:
-                depth += 1
-                current += char
-            elif char == ')' and not in_string:
-                depth -= 1
-                current += char
-            elif char == ',' and depth == 0 and not in_string:
-                args.append(current.strip())
-                current = ""
-            else:
-                current += char
-
-        if current.strip():
-            args.append(current.strip())
-
-        return args
-
-    def _convert_iif_to_case(self, expr: str) -> str:
-        """Convert IIF(condition, true_val, false_val) to CASE WHEN ... THEN ... ELSE ... END."""
-        import re
-        result = expr
-
-        # Process IIF functions from innermost to outermost
-        max_iterations = 50  # Prevent infinite loops
-        iteration = 0
-
-        while iteration < max_iterations:
-            # Find IIF( (case insensitive)
-            iif_match = re.search(r'\bIIF\s*\(', result, re.IGNORECASE)
-            if not iif_match:
-                break
-
-            start_idx = iif_match.start()
-            paren_start = iif_match.end() - 1  # Index of '('
-            paren_end = self._find_matching_paren(result, paren_start)
-
-            if paren_end == -1:
-                # Malformed expression, skip
-                break
-
-            # Extract arguments
-            args_str = result[paren_start + 1:paren_end]
-            args = self._split_iif_args(args_str)
-
-            if len(args) >= 3:
-                condition = args[0]
-                true_val = args[1]
-                false_val = args[2]
-
-                # Recursively convert any nested IIF in arguments
-                condition = self._convert_iif_to_case(condition)
-                true_val = self._convert_iif_to_case(true_val)
-                false_val = self._convert_iif_to_case(false_val)
-
-                # Build CASE WHEN statement
-                case_expr = f"CASE WHEN {condition} THEN {true_val} ELSE {false_val} END"
-
-                # Replace the IIF(...) with CASE WHEN
-                result = result[:start_idx] + case_expr + result[paren_end + 1:]
-            else:
-                # Not enough arguments, skip this IIF
-                break
-
-            iteration += 1
-
-        return result
-
-    def _convert_isnull(self, expr: str) -> str:
-        """Convert IsNull(field) to (field IS NULL)."""
-        import re
-        result = expr
-        max_iterations = 50
-        iteration = 0
-
-        while iteration < max_iterations:
-            match = re.search(r'\bIsNull\s*\(', result, re.IGNORECASE)
-            if not match:
-                break
-
-            start_idx = match.start()
-            paren_start = match.end() - 1
-            paren_end = self._find_matching_paren(result, paren_start)
-
-            if paren_end == -1:
-                break
-
-            field = result[paren_start + 1:paren_end].strip()
-            sql_expr = f"({field} IS NULL)"
-
-            result = result[:start_idx] + sql_expr + result[paren_end + 1:]
-            iteration += 1
-
-        return result
-
-    def _convert_isempty(self, expr: str) -> str:
-        """Convert IsEmpty(field) to (field = '')."""
-        import re
-        result = expr
-        max_iterations = 50
-        iteration = 0
-
-        while iteration < max_iterations:
-            match = re.search(r'\bIsEmpty\s*\(', result, re.IGNORECASE)
-            if not match:
-                break
-
-            start_idx = match.start()
-            paren_start = match.end() - 1
-            paren_end = self._find_matching_paren(result, paren_start)
-
-            if paren_end == -1:
-                break
-
-            field = result[paren_start + 1:paren_end].strip()
-            sql_expr = f"({field} = '')"
-
-            result = result[:start_idx] + sql_expr + result[paren_end + 1:]
-            iteration += 1
-
-        return result
+        return self._formula_converter.convert(expr)
 
     def get_data_lineage(self) -> List[DataLineage]:
         """Trace data lineage from all sources to all targets."""

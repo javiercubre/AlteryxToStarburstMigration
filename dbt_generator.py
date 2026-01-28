@@ -195,8 +195,11 @@ class DBTGenerator:
         target_macros_dir = self.output_dir / "macros" / "migration"
 
         if not source_macros_dir.exists():
-            print(f"Warning: Migration macros directory not found at {source_macros_dir}")
-            return
+            raise FileNotFoundError(
+                f"Migration macros directory not found at {source_macros_dir}. "
+                f"The dbt_macros/ directory is required for DBT generation. "
+                f"Please ensure it exists in the same directory as dbt_generator.py."
+            )
 
         # Copy all .sql files from dbt_macros to the generated project
         macro_files = list(source_macros_dir.glob("*.sql"))
@@ -444,11 +447,15 @@ class DBTGenerator:
                     field = self._quote_column(sf['field'])
                     order_parts.append(f"{field} {direction}")
                 order_clause = ", ".join(order_parts)
+                # MED-07 fix: ORDER BY in CTE doesn't guarantee ordering in final result
+                # Move ORDER BY to final SELECT or add LIMIT to force materialization
                 return f"""{cte_name} as (
     -- {node.plugin_name}: {node.annotation or ''}
+    -- NOTE: ORDER BY in CTE only affects this CTE's output, not final query result
+    -- To guarantee ordering, add ORDER BY to your final SELECT statement
     select *
     from {source_cte}
-    order by {order_clause}
+    -- Sort order: {order_clause}
 )"""
 
         elif node.plugin_name == "Summarize":
@@ -878,15 +885,37 @@ class DBTGenerator:
 
         return parts
 
-    def _get_node_columns(self, node: AlteryxNode, workflow: AlteryxWorkflow) -> List[str]:
+    def _get_node_columns(self, node: AlteryxNode, workflow: AlteryxWorkflow,
+                          _visiting: Optional[Set[int]] = None) -> List[str]:
         """Get available columns at a node by tracing data lineage.
 
         This determines what columns are available after a node's transformation
         by looking at upstream columns and the node's own transformations.
+
+        Args:
+            node: The node to get columns for
+            workflow: The workflow containing the node
+            _visiting: Internal set for cycle detection (HIGH-08 fix)
+
+        Returns:
+            List of column names available at this node
         """
         # Check cache first
         if node.tool_id in self._node_columns:
             return self._node_columns[node.tool_id]
+
+        # Initialize visiting set for cycle detection (HIGH-08 fix)
+        if _visiting is None:
+            _visiting = set()
+
+        # Detect circular dependency - if we're already visiting this node,
+        # we have a cycle. Return empty to break the recursion.
+        if node.tool_id in _visiting:
+            print(f"Warning: Circular dependency detected at tool #{node.tool_id} ({node.plugin_name})")
+            return []
+
+        # Mark this node as being visited
+        _visiting.add(node.tool_id)
 
         columns = []
 
@@ -894,7 +923,7 @@ class DBTGenerator:
         upstream_nodes = workflow.get_upstream_nodes(node.tool_id)
         upstream_columns = []
         for up_node in upstream_nodes:
-            upstream_columns.extend(self._get_node_columns(up_node, workflow))
+            upstream_columns.extend(self._get_node_columns(up_node, workflow, _visiting))
         # Remove duplicates while preserving order
         upstream_columns = list(dict.fromkeys(upstream_columns))
 
@@ -1416,22 +1445,23 @@ class DBTGenerator:
                     field = self._quote_column(sf['field'])
                     order_parts.append(f"{field} {direction}")
                 order_clause = ", ".join(order_parts)
-                # Sort passes through all columns
+                # MED-07 fix: ORDER BY in CTE doesn't guarantee ordering in final result
+                # Sort passes through all columns; ordering noted in comments
                 if upstream_columns:
                     col_list = self._format_column_list(upstream_columns)
                     return f"""{cte_name} as (
     -- {node.plugin_name}: {node.annotation or ''}
+    -- NOTE: To guarantee ordering, add ORDER BY to final SELECT: {order_clause}
     select
         {col_list}
     from {source_cte}
-    order by {order_clause}
 ),"""
                 else:
                     return f"""{cte_name} as (
     -- {node.plugin_name}: {node.annotation or ''}
+    -- NOTE: To guarantee ordering, add ORDER BY to final SELECT: {order_clause}
     select *  -- TODO: specify columns
     from {source_cte}
-    order by {order_clause}
 ),"""
 
         # Default pass-through with explicit columns if available
@@ -1557,7 +1587,47 @@ class DBTGenerator:
         ]
 
         # Generate CTEs for upstream dependencies
-        if upstream:
+        # For Join tools, use proper left/right ordering (HIGH-02 fix)
+        if node.plugin_name == "Join" and len(upstream) >= 2:
+            left_node, right_node = self._get_join_upstream_ordered(node, workflow)
+            ordered_upstream = []
+            if left_node:
+                ordered_upstream.append(("left_source", left_node))
+            if right_node:
+                ordered_upstream.append(("right_source", right_node))
+
+            for i, (cte_name, up_node) in enumerate(ordered_upstream):
+                up_model = self._get_model_reference(up_node, workflow_prefix)
+                up_columns = self._get_node_columns(up_node, workflow)
+                is_last = (i == len(ordered_upstream) - 1)
+                if up_columns:
+                    col_list = self._format_column_list(up_columns)
+                    content.extend([
+                        f"with {cte_name} as (" if i == 0 else f"{cte_name} as (",
+                        "",
+                        f"    select",
+                        f"        {col_list}",
+                        f"    from {{{{ ref('{up_model}') }}}}",
+                        "",
+                        ")," if not is_last else "),",
+                        "",
+                    ])
+                else:
+                    content.extend([
+                        f"with {cte_name} as (" if i == 0 else f"{cte_name} as (",
+                        "",
+                        f"    select * from {{{{ ref('{up_model}') }}}}  -- TODO: specify columns",
+                        "",
+                        ")," if not is_last else "),",
+                        "",
+                    ])
+                    self._add_todo(
+                        todo_type="specify_columns",
+                        description=f"Specify columns from upstream model '{up_model}'",
+                        context=f"CTE: {cte_name} ({'Left' if 'left' in cte_name else 'Right'} input)",
+                        priority="medium"
+                    )
+        elif upstream:
             for i, up_node in enumerate(upstream):
                 up_model = self._get_model_reference(up_node, workflow_prefix)
                 cte_name = f"source_{i + 1}" if len(upstream) > 1 else "source"
@@ -1743,6 +1813,39 @@ class DBTGenerator:
             return f"stg_{workflow_prefix}_{table}"
         else:
             return f"int_{workflow_prefix}_{self._sanitize_name(node.get_display_name())}"
+
+    def _get_join_upstream_ordered(self, node: AlteryxNode,
+                                    workflow: AlteryxWorkflow) -> Tuple[Optional[AlteryxNode], Optional[AlteryxNode]]:
+        """Get properly ordered Left and Right upstream nodes for a Join tool.
+
+        Returns (left_node, right_node) based on Alteryx connection anchors.
+        This fixes HIGH-02: Join tool left/right relation handling.
+
+        Args:
+            node: The Join tool node
+            workflow: The workflow containing the node
+
+        Returns:
+            Tuple of (left_node, right_node), either may be None if not connected
+        """
+        left_node = workflow.get_upstream_node_by_anchor(node.tool_id, "Left")
+        right_node = workflow.get_upstream_node_by_anchor(node.tool_id, "Right")
+
+        # Fallback: if anchors not found, check for generic input naming
+        if left_node is None and right_node is None:
+            # Try numbered inputs (some versions use "Input #1", "Input #2")
+            left_node = workflow.get_upstream_node_by_anchor(node.tool_id, "Input #1")
+            right_node = workflow.get_upstream_node_by_anchor(node.tool_id, "Input #2")
+
+        # Final fallback: use first two upstream nodes in order
+        if left_node is None and right_node is None:
+            upstream = workflow.get_upstream_nodes(node.tool_id)
+            if len(upstream) >= 1:
+                left_node = upstream[0]
+            if len(upstream) >= 2:
+                right_node = upstream[1]
+
+        return (left_node, right_node)
 
     def _generate_macro_reference_sql(self, node: AlteryxNode,
                                        upstream: List[AlteryxNode],
@@ -2102,26 +2205,28 @@ select * from final  -- TODO: specify columns"""
                 if len(parts) == 2:
                     left_col = self._quote_column(parts[0].strip())
                     right_col = self._quote_column(parts[1].strip())
-                    conditions.append(f"source_1.{left_col} = source_2.{right_col}")
+                    # Use left_source/right_source to match CTE names (HIGH-02 fix)
+                    conditions.append(f"left_source.{left_col} = right_source.{right_col}")
 
             join_condition = " and ".join(conditions) if conditions else "1=1"
 
             # For joins, we need columns from both sources
+            # Use proper left_source/right_source naming to match CTEs (HIGH-02 fix)
             if upstream_columns:
                 # Prefix columns with source alias to avoid ambiguity
-                col_parts = [f"source_1.{self._quote_column(c)}" for c in upstream_columns]
+                col_parts = [f"left_source.{self._quote_column(c)}" for c in upstream_columns]
                 col_list = ",\n        ".join(col_parts)
                 final_col_list = self._format_column_list(upstream_columns)
             else:
-                col_list = "source_1.*  -- TODO: specify columns from both sources"
+                col_list = "left_source.*  -- TODO: specify columns from both sources"
                 final_col_list = "*  -- TODO: specify columns"
 
             return f"""final as (
 
     select
         {col_list}
-    from source_1
-    {join_type.lower()} join source_2
+    from left_source
+    {join_type.lower()} join right_source
         on {join_condition}
 
 )
@@ -2227,7 +2332,8 @@ from final"""
                     order_parts.append(f"{field} {direction}")
                 order_clause = ", ".join(order_parts)
 
-                # Sort passes through all columns
+                # MED-07 fix: ORDER BY must be in final SELECT to guarantee ordering
+                # Moving ORDER BY from CTE to final SELECT for correct behavior
                 if upstream_columns:
                     col_list = self._format_column_list(upstream_columns)
                     return f"""final as (
@@ -2235,23 +2341,23 @@ from final"""
     select
         {col_list}
     from {source_cte}
-    order by {order_clause}
 
 )
 
 select
     {col_list}
-from final"""
+from final
+order by {order_clause}"""
                 else:
                     return f"""final as (
 
     select *  -- TODO: specify columns
     from {source_cte}
-    order by {order_clause}
 
 )
 
-select * from final  -- TODO: specify columns"""
+select * from final  -- TODO: specify columns
+order by {order_clause}"""
 
         # Default
         if upstream_columns:
