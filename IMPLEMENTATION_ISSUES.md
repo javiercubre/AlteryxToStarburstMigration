@@ -3,18 +3,33 @@
 This document provides a critical analysis of the Alteryx to Starburst/DBT Migration Tool implementation, identifying bugs, design flaws, incomplete features, and areas for improvement.
 
 **Analysis Date:** 2026-01-28
+**Last Updated:** 2026-01-29
 **Codebase Size:** ~7,500 lines across 13 modules
 
 ---
 
 ## Summary
 
-| Severity | Count | Description |
-|----------|-------|-------------|
-| **Critical** | 4 | Must fix - blocks functionality or causes incorrect output |
-| **High** | 8 | Should fix - significant impact on quality or maintainability |
-| **Medium** | 10 | Consider fixing - improves robustness or user experience |
-| **Low** | 6 | Nice to have - code quality improvements |
+| Severity | Count | Fixed | Remaining | Description |
+|----------|-------|-------|-----------|-------------|
+| **Critical** | 4 | 4 | 0 | Must fix - blocks functionality or causes incorrect output |
+| **High** | 8 | 8 | 0 | Should fix - significant impact on quality or maintainability |
+| **Medium** | 10 | 0 | 10 | Consider fixing - improves robustness or user experience |
+| **Low** | 6 | 0 | 6 | Nice to have - code quality improvements |
+
+### Fixed Issues (2026-01-29)
+- **CRIT-01**: Macro-first generation now implemented
+- **CRIT-02**: Expression conversion consolidated to FormulaConverter
+- **CRIT-03**: Invalid SQL placeholders fixed (TODOs moved to block comments)
+- **CRIT-04**: FileNotFoundError raised when macros directory missing
+- **HIGH-01**: `_build_macro_parameters()` implemented
+- **HIGH-02**: Join tool left/right relation handling fixed
+- **HIGH-03**: Missing formula functions added (RecordID, RunningSum, etc.)
+- **HIGH-04**: Aggregation mappings completed (GroupConcat, Percentiles, etc.)
+- **HIGH-05**: SQL validation via `dbt compile` added with --validate flag
+- **HIGH-06**: Container children now expanded for processing
+- **HIGH-07**: Date format conversion completed (%e, %j, %U, %W)
+- **HIGH-08**: Cycle detection added with visiting set
 
 ---
 

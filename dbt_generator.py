@@ -1077,9 +1077,12 @@ class DBTGenerator:
         return all_columns
 
     def _format_column_list(self, columns: List[str], indent: str = "        ") -> str:
-        """Format a list of columns for SQL SELECT, with proper quoting."""
+        """Format a list of columns for SQL SELECT, with proper quoting.
+
+        CRIT-03 fix: When columns unknown, returns valid SQL with TODO on separate line.
+        """
         if not columns:
-            return f"{indent}*  -- TODO: specify columns"
+            return f"{indent}*\n{indent}/* TODO: specify columns */"
         quoted = [self._quote_column(c) for c in columns]
         return f",\n{indent}".join(quoted)
 
@@ -1428,7 +1431,9 @@ class DBTGenerator:
                     content.extend([
                         f"with {cte_name} as (",
                         "",
-                        f"    select * from {{{{ ref('{up_model}') }}}}  -- TODO: specify columns",
+                        f"    select *",
+                        f"    /* TODO: specify columns */",
+                        f"    from {{{{ ref('{up_model}') }}}}",
                         "",
                         ")," if i < len(upstream) - 1 else "),",
                         "",
@@ -1479,7 +1484,7 @@ class DBTGenerator:
             final_col_list = self._format_column_list(final_columns)
             return "\n\n".join(cte_parts) + f"\n\nselect\n    {final_col_list}\nfrom final"
         else:
-            return "\n\n".join(cte_parts) + "\n\nselect * from final  -- TODO: specify columns"
+            return "\n\n".join(cte_parts) + "\n\nselect *\n/* TODO: specify columns */\nfrom final"
 
     def _generate_single_transform_cte(self, node: AlteryxNode, source_cte: str, cte_name: str,
                                         workflow: AlteryxWorkflow) -> str:
@@ -1502,7 +1507,8 @@ class DBTGenerator:
             else:
                 return f"""{cte_name} as (
     -- {node.plugin_name}: {node.annotation or ''}
-    select *  -- TODO: specify columns
+    select
+        * /* TODO: specify columns */
     from {source_cte}
     where {condition}
 ),"""
@@ -1514,7 +1520,7 @@ class DBTGenerator:
                 if upstream_columns:
                     select_parts = [self._quote_column(c) for c in upstream_columns]
                 else:
-                    select_parts = ["*  -- TODO: specify columns"]
+                    select_parts = ["* /* TODO: specify columns */"]
                 for f in formulas:
                     field = self._quote_column(f.get('field', 'new_field'))
                     expr = self._convert_expression(f.get('expression', 'NULL'))
@@ -1564,7 +1570,8 @@ class DBTGenerator:
                     return f"""{cte_name} as (
     -- {node.plugin_name}: {node.annotation or ''}
     -- NOTE: To guarantee ordering, add ORDER BY to final SELECT: {order_clause}
-    select *  -- TODO: specify columns
+    select
+        * /* TODO: specify columns */
     from {source_cte}
 ),"""
 
@@ -1580,7 +1587,8 @@ class DBTGenerator:
         else:
             return f"""{cte_name} as (
     -- {node.plugin_name}: {node.annotation or ''} (TODO: implement)
-    select *  -- TODO: specify columns
+    select
+        * /* TODO: specify columns */
     from {source_cte}
 ),"""
 
@@ -1618,8 +1626,8 @@ class DBTGenerator:
             source_select = f"    select\n        {source_col_list}\n    from {{{{ source('{schema}', '{table}') }}}}"
             final_select = f"select\n    {','.join(chr(10) + '    ' + self._quote_column(c) for c in columns)}\nfrom renamed"
         else:
-            source_select = f"    select * from {{{{ source('{schema}', '{table}') }}}}  -- TODO: specify columns"
-            final_select = "select * from renamed  -- TODO: specify columns"
+            source_select = f"    select *\n    /* TODO: specify columns */\n    from {{{{ source('{schema}', '{table}') }}}}"
+            final_select = "select *\n/* TODO: specify columns */\nfrom renamed"
 
         content = [
             f"-- Bronze model for {node.get_display_name()}",
@@ -1720,7 +1728,9 @@ class DBTGenerator:
                     content.extend([
                         f"with {cte_name} as (" if i == 0 else f"{cte_name} as (",
                         "",
-                        f"    select * from {{{{ ref('{up_model}') }}}}  -- TODO: specify columns",
+                        f"    select *",
+                        f"    /* TODO: specify columns */",
+                        f"    from {{{{ ref('{up_model}') }}}}",
                         "",
                         ")," if not is_last else "),",
                         "",
@@ -1753,7 +1763,9 @@ class DBTGenerator:
                     content.extend([
                         f"with {cte_name} as (",
                         "",
-                        f"    select * from {{{{ ref('{up_model}') }}}}  -- TODO: specify columns",
+                        f"    select *",
+                        f"    /* TODO: specify columns */",
+                        f"    from {{{{ ref('{up_model}') }}}}",
                         "",
                         ")," if i < len(upstream) - 1 else "),",
                         "",
@@ -1861,7 +1873,9 @@ class DBTGenerator:
                     content.extend([
                         f"with {cte_name} as (",
                         "",
-                        f"    select * from {{{{ ref('{up_model}') }}}}  -- TODO: specify columns",
+                        f"    select *",
+                        f"    /* TODO: specify columns */",
+                        f"    from {{{{ ref('{up_model}') }}}}",
                         "",
                         ")," if i < len(upstream) - 1 else "),",
                         "",
@@ -2258,13 +2272,16 @@ from final"""
             else:
                 return f"""final as (
 
-    select *  -- TODO: specify columns
+    select
+        * /* TODO: specify columns */
     from {source_cte}
     where {condition}
 
 )
 
-select * from final  -- TODO: specify columns"""
+select *
+/* TODO: specify columns */
+from final"""
 
         elif node.plugin_name in ["Formula", "Multi-Field Formula"]:
             formulas = node.configuration.get('formulas', [])
@@ -2273,7 +2290,7 @@ select * from final  -- TODO: specify columns"""
                 if upstream_columns:
                     select_parts = [f"    {self._quote_column(c)}" for c in upstream_columns]
                 else:
-                    select_parts = ["    *  -- TODO: specify columns"]
+                    select_parts = ["    * /* TODO: specify columns */"]
                 for f in formulas:
                     field = self._quote_column(f.get('field', 'new_field'))
                     expr = self._convert_expression(f.get('expression', 'NULL'))
@@ -2284,7 +2301,7 @@ select * from final  -- TODO: specify columns"""
                     final_col_list = self._format_column_list(node_columns)
                     final_select = f"select\n    {final_col_list}\nfrom final"
                 else:
-                    final_select = "select * from final  -- TODO: specify columns"
+                    final_select = "select *\n/* TODO: specify columns */\nfrom final"
 
                 return f"""final as (
 
@@ -2299,7 +2316,7 @@ select * from final  -- TODO: specify columns"""
                 if upstream_columns:
                     col_list = self._format_column_list(upstream_columns)
                     return f"select\n    {col_list}\nfrom {source_cte}"
-                return f"select * from {source_cte}  -- TODO: specify columns"
+                return f"select *\n/* TODO: specify columns */\nfrom {source_cte}"
 
         elif node.plugin_name == "Join":
             join_type = node.join_type or "LEFT"
@@ -2322,8 +2339,8 @@ select * from final  -- TODO: specify columns"""
                 col_list = ",\n        ".join(col_parts)
                 final_col_list = self._format_column_list(upstream_columns)
             else:
-                col_list = "left_source.*  -- TODO: specify columns from both sources"
-                final_col_list = "*  -- TODO: specify columns"
+                col_list = "left_source.* /* TODO: specify columns from both sources */"
+                final_col_list = "* /* TODO: specify columns */"
 
             return f"""final as (
 
@@ -2393,12 +2410,12 @@ from final"""
                         col_list = self._format_column_list(up_cols)
                         union_parts.append(f"select\n    {col_list}\nfrom source_{i + 1}")
                     else:
-                        union_parts.append(f"select * from source_{i + 1}  -- TODO: specify columns")
+                        union_parts.append(f"select *\n/* TODO: specify columns */\nfrom source_{i + 1}")
                 return "\n\nunion all\n\n".join(union_parts)
             if upstream_columns:
                 col_list = self._format_column_list(upstream_columns)
                 return f"select\n    {col_list}\nfrom {source_cte}"
-            return f"select * from {source_cte}  -- TODO: specify columns"
+            return f"select *\n/* TODO: specify columns */\nfrom {source_cte}"
 
         elif node.plugin_name == "Select":
             if node.selected_fields:
@@ -2455,12 +2472,15 @@ order by {order_clause}"""
                 else:
                     return f"""final as (
 
-    select *  -- TODO: specify columns
+    select
+        * /* TODO: specify columns */
     from {source_cte}
 
 )
 
-select * from final  -- TODO: specify columns
+select *
+/* TODO: specify columns */
+from final
 order by {order_clause}"""
 
         # Default
@@ -2483,12 +2503,14 @@ from final"""
 
     select
         -- TODO: Implement {node.plugin_name} transformation
-        *  -- TODO: specify columns
+        * /* TODO: specify columns */
     from {source_cte}
 
 )
 
-select * from final  -- TODO: specify columns"""
+select *
+/* TODO: specify columns */
+from final"""
 
     def _convert_expression(self, expr: str) -> str:
         """Convert Alteryx expression to Trino SQL with quoted identifiers.
