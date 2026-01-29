@@ -2970,6 +2970,7 @@ tests:
         return sanitized or "unknown"
 
     def _write_file(self, path: Path, content: str) -> None:
-        """Write content to a file."""
+        """Write content to a file, creating parent directories if needed."""
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(content)
